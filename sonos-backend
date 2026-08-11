@@ -7,20 +7,30 @@ DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
 DATA_DIR="${DATA_HOME}/${PLUGIN_ID}"
 VENV_DIR="${DATA_DIR}/venv"
 LOCK_FILE="${DATA_DIR}/setup.lock"
+REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 PYTHON_BIN="${OMASONOS_PYTHON:-python3}"
 
 mkdir -p "$DATA_DIR"
 exec 9>"$LOCK_FILE"
 flock 9
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+requirements_hash="$(sha256sum "$PLUGIN_DIR/requirements.lock" | awk '{print $1}')"
+installed_hash=""
+if [[ -f "$REQ_HASH_FILE" ]]; then
+  installed_hash="$(cat "$REQ_HASH_FILE" 2>/dev/null || true)"
+fi
+
+if [[ ! -x "$VENV_DIR/bin/python" || "$installed_hash" != "$requirements_hash" ]]; then
   tmp_venv="${VENV_DIR}.tmp.$$"
   rm -rf "$tmp_venv"
+  trap 'rm -rf "$tmp_venv"' EXIT
   "$PYTHON_BIN" -m venv "$tmp_venv"
   "$tmp_venv/bin/python" -m pip install --disable-pip-version-check --upgrade pip >&2
   "$tmp_venv/bin/python" -m pip install --disable-pip-version-check -r "$PLUGIN_DIR/requirements.lock" >&2
+  printf '%s\n' "$requirements_hash" > "$tmp_venv/.requirements.sha256"
   rm -rf "$VENV_DIR"
   mv "$tmp_venv" "$VENV_DIR"
+  trap - EXIT
 fi
 
 flock -u 9

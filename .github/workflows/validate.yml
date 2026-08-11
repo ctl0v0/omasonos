@@ -17,8 +17,8 @@ jobs:
       - name: Unit tests
         run: python -m pytest -q
       - name: Python syntax
-        run: python -m compileall -q sonos_service.py omasonos_backend
+        run: python -m compileall -q sonos_service.py omasonos_backend scripts/smoke-backend.py
       - name: Shell syntax
-        run: bash -n sonos-backend
+        run: bash -n sonos-backend scripts/install-local.sh scripts/test-local.sh
       - name: Manifest contract
         run: python tests/validate_manifest.py

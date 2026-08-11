@@ -28,9 +28,9 @@ repository owner.
 
 ### SoCo version
 
-The plan pinned SoCo `0.31.2`. PyPI has no `0.31.2` release; the available
-release with Python 3.14 classification is `0.31.1`, so milestone one pins
-`soco==0.31.1`.
+The plan pins SoCo `0.31.2`. A later verification against current PyPI metadata
+confirmed that `0.31.2` was released on July 29, 2026 and includes Python 3.14
+classification. Milestone one therefore pins `soco==0.31.2`.
 
 ## Architecture decisions retained
 

@@ -52,6 +52,34 @@ ${XDG_STATE_HOME:-~/.local/state}/io.github.ctl0v0.omasonos/state.json
 
 No Sonos account credentials or cloud tokens are stored.
 
+
+### Local checkout install
+
+From a checkout on your Omarchy machine, you can install/update the development
+copy without publishing to GitHub:
+
+```bash
+./scripts/install-local.sh
+```
+
+Then run the local test wrapper:
+
+```bash
+./scripts/test-local.sh
+```
+
+It validates the manifest, confirms `omarchy-shell` can see the plugin, runs the
+Python tests when `pytest` is installed, and performs a read-only backend
+discovery smoke test. To run only the backend check:
+
+```bash
+./scripts/smoke-backend.py
+```
+
+The smoke test is successful even when no speakers are found; in that case it
+prints `status: offline`. On the real Sonos LAN it should also report households,
+rooms, and the selected target group.
+
 ## Current controls
 
 - Left click: open/close the controller card.
@@ -99,10 +127,9 @@ Stdout is reserved for JSON protocol messages; diagnostics go to stderr.
 
 ## Dependency note
 
-The implementation pins SoCo `0.31.1`. The uploaded planning document named
-`0.31.2`, but that release does not exist. Before a public/controller release,
-`requirements.lock` still needs to be regenerated as a fully transitive,
-hash-locked Python 3.14 lockfile on the target Arch environment.
+The implementation pins SoCo `0.31.2`, matching the planning document. Before a
+public/controller release, `requirements.lock` still needs to be regenerated as a
+fully transitive, hash-locked Python 3.14 lockfile on the target Arch environment.
 
 ## Next milestones
 

@@ -1,4 +1,4 @@
 # Initial exact dependency pin for the controller milestone.
 # Release hardening will replace this with a fully transitive, hash-locked file
 # generated on the target Python 3.14 / Arch environment.
-soco==0.31.1
+soco==0.31.2

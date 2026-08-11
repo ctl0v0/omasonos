@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ctl0v0.omasonos",
+  "name": "OmaSonos",
+  "version": "0.1.0",
+  "author": "ctl0v0",
+  "description": "Local-first Sonos control for the Omarchy bar",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaSonos",
+    "description": "Sonos now-playing, playback, volume, groups, and rooms",
+    "category": "Media",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

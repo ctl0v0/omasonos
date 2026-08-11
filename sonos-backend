@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_ID="io.github.ctl0v0.omasonos"
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+DATA_DIR="${DATA_HOME}/${PLUGIN_ID}"
+VENV_DIR="${DATA_DIR}/venv"
+LOCK_FILE="${DATA_DIR}/setup.lock"
+PYTHON_BIN="${OMASONOS_PYTHON:-python3}"
+
+mkdir -p "$DATA_DIR"
+exec 9>"$LOCK_FILE"
+flock 9
+
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  tmp_venv="${VENV_DIR}.tmp.$$"
+  rm -rf "$tmp_venv"
+  "$PYTHON_BIN" -m venv "$tmp_venv"
+  "$tmp_venv/bin/python" -m pip install --disable-pip-version-check --upgrade pip >&2
+  "$tmp_venv/bin/python" -m pip install --disable-pip-version-check -r "$PLUGIN_DIR/requirements.lock" >&2
+  rm -rf "$VENV_DIR"
+  mv "$tmp_venv" "$VENV_DIR"
+fi
+
+flock -u 9
+exec "$VENV_DIR/bin/python" -u "$PLUGIN_DIR/sonos_service.py"

@@ -76,9 +76,31 @@ discovery smoke test. To run only the backend check:
 ./scripts/smoke-backend.py
 ```
 
+To explicitly test whether this machine can open Sonos's HTTP/UPnP port on a
+known speaker, pass its address (repeat `--host` for multiple speakers):
+
+```bash
+./scripts/smoke-backend.py --host 192.168.1.42
+```
+
 The smoke test is successful even when no speakers are found; in that case it
-prints `status: offline`. On the real Sonos LAN it should also report households,
-rooms, and the selected target group.
+prints `status: offline`. It also reports whether discovery found speakers via
+the cached-host path, SSDP multicast, or the attached-network scan fallback.
+On the real Sonos LAN it should also report households, rooms, and the selected
+target group.
+The report includes every local IPv4 interface/subnet, both discovery cycles,
+and a TCP/1400 probe for each supplied or discovered speaker address.
+
+Discovery tries cached speaker addresses first. When one responds, its Sonos
+topology supplies the household rooms without adding an SSDP delay to routine
+polls or commands. If all cached addresses miss, OmaSonos uses SoCo's normal
+five-second SSDP window and then its local IPv4 network scanner (port 1400),
+rate-limiting that heavier fallback to once per minute while offline.
+
+When the machine is reachable from Sonos, OmaSonos subscribes to topology,
+transport, group-volume, and room-volume events on TCP `1400-1499`. Event bursts
+are coalesced for 75 ms before a fast refresh. If any required subscription or
+callback listener fails, the service automatically retains its polling fallback.
 
 ## Current controls
 
@@ -88,8 +110,18 @@ rooms, and the selected target group.
 - Previous / play-pause / next honor Sonos `available_actions`.
 - Group volume and mute are wired to the backend.
 - Multiple active groups can be selected explicitly.
-- The room mixer exposes per-room volume and mute.
-- Room membership is staged locally with Everywhere / Cancel / Apply.
+- `Playing on: …` shows the current destination and expands into room and
+  actual multi-room-group choices for moving the current queue. Standalone
+  rooms are not mislabeled as groups.
+- `Favorites` caches directly playable Sonos Favorites and starts one on the
+  current destination. Saved containers without a playable URI are reported
+  but intentionally omitted.
+- `Control different audio` is a separate collapsed action for switching which
+  independent playback session the transport controls address without moving it.
+- The room mixer exposes per-room volume and mute, with an accent-colored,
+  pulsing music-note indicator beside every room whose Sonos group is active.
+- Lower-priority room membership editing is collapsed under `Group settings`,
+  with staged Everywhere / Cancel / Apply actions.
 - Seek appears only when Sonos reports `SeekTime` support and a duration.
 
 ## Development
@@ -134,7 +166,6 @@ fully transitive, hash-locked Python 3.14 lockfile on the target Arch environmen
 ## Next milestones
 
 1. Add the full keyboard model and polish the group/room views for large households.
-2. Add event subscriptions for topology, AVTransport, group volume, and rendering control with polling fallback.
-3. Add richer fake-SoCo fixtures for coordinator removal, cross-group moves, partial topology failures, and multiple households.
-4. Validate on real Sonos S2 hardware and against external changes made in the Sonos app.
-5. Add the optional PipeWire/AirPlay phase only after controller stability.
+2. Add richer fake-SoCo fixtures for coordinator removal, cross-group moves, partial topology failures, and multiple households.
+3. Validate the remaining real Sonos S2 scenarios and external changes made in the Sonos app.
+4. Add the optional PipeWire/AirPlay phase only after controller stability.

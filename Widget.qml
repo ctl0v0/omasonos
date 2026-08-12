@@ -8,34 +8,84 @@ BarWidget {
   moduleName: "io.github.ctl0v0.omasonos"
 
   readonly property var sonos: bar?.shell?.serviceFor(moduleName)
-  readonly property var playback: sonos ? sonos.playback : ({})
-  readonly property var target: sonos ? sonos.target : null
+  readonly property var serviceSnapshot: sonos && sonos.snapshot ? sonos.snapshot : null
+  readonly property var playback: serviceSnapshot && serviceSnapshot.playback
+    ? serviceSnapshot.playback : ({})
+  readonly property var target: serviceSnapshot ? serviceSnapshot.target : null
+  readonly property string selectedRoomUid: serviceSnapshot
+    ? String(serviceSnapshot.selectedAnchorRoomUid || "") : ""
+  readonly property var favorites: serviceSnapshot && serviceSnapshot.favorites
+    ? serviceSnapshot.favorites : ({ state: "not_loaded", items: [], total: 0, unsupported: 0, error: "" })
   readonly property bool online: sonos && sonos.ready && target !== null
-  readonly property bool playing: String(playback.state || "").toUpperCase() === "PLAYING"
+  readonly property string connectionState: serviceSnapshot && serviceSnapshot.status
+    ? String(serviceSnapshot.status.state || "starting") : "starting"
+  readonly property bool connectionProblem: connectionState === "error"
+    || connectionState === "setup_error"
+  readonly property string disconnectedTitle: connectionProblem
+    ? "Sonos needs attention"
+    : (connectionState === "starting" || connectionState === "discovering"
+      ? "Looking for Sonos"
+      : "Away from Sonos")
+  readonly property string disconnectedDetail: connectionProblem
+    ? (sonos && sonos.lastError
+      ? sonos.lastError
+      : (serviceSnapshot && serviceSnapshot.status
+        ? String(serviceSnapshot.status.message || "OmaSonos could not start.")
+        : "OmaSonos could not start."))
+    : (connectionState === "starting" || connectionState === "discovering"
+      ? "Checking this network for your speakers…"
+      : "You’re not on your Sonos network. OmaSonos will reconnect automatically when you’re back on the same Wi-Fi.")
+  readonly property bool favoriteStarting: sonos
+    && (sonos.favoriteRequestId !== "" || sonos.favoriteAwaitingSnapshot)
+  readonly property bool movePending: sonos && sonos.moveRequestId !== ""
+  readonly property string favoriteStartingTitle: sonos
+    ? String(sonos.favoriteStartingTitle || "") : ""
+  readonly property string playbackState: String(playback.state || "").toUpperCase()
+  readonly property bool playing: playbackState === "PLAYING"
   readonly property string title: String(playback.title || "")
   readonly property string artist: String(playback.artist || "")
   readonly property string roomLabel: target ? String(target.roomLabel || "Sonos") : "Sonos"
+  readonly property string barLabel: {
+    if (!online) return disconnectedTitle
+    if (title !== "") {
+      return roomLabel + " · " + title + (artist !== "" ? " — " + artist : "")
+    }
+    if (playbackState === "PAUSED_PLAYBACK") return roomLabel + " · Paused"
+    return roomLabel
+  }
   readonly property var actions: playback.availableActions || []
   readonly property var activeHousehold: {
     if (!target) return null
-    for (var i = 0; i < sonos.households.length; i++) {
-      if (sonos.households[i].id === target.householdId) return sonos.households[i]
+    var households = serviceSnapshot && serviceSnapshot.households
+      ? serviceSnapshot.households : []
+    for (var i = 0; i < households.length; i++) {
+      if (households[i].id === target.householdId) return households[i]
     }
     return null
   }
   readonly property var groups: activeHousehold ? activeHousehold.groups : []
+  readonly property var multiRoomGroups: {
+    var out = []
+    for (var i = 0; i < groups.length; i++) {
+      if (groups[i].memberUids && groups[i].memberUids.length > 1) out.push(groups[i])
+    }
+    return out
+  }
   readonly property var allGroups: {
     var out = []
-    if (!sonos) return out
-    for (var h = 0; h < sonos.households.length; h++) {
-      var household = sonos.households[h]
+    var households = serviceSnapshot && serviceSnapshot.households
+      ? serviceSnapshot.households : []
+    for (var h = 0; h < households.length; h++) {
+      var household = households[h]
       for (var g = 0; g < household.groups.length; g++) {
         var entry = household.groups[g]
         out.push({
           uid: entry.uid,
           label: entry.label,
           householdId: household.id,
-          playbackState: entry.playbackState
+          playbackState: entry.playbackState,
+          volume: entry.volume,
+          mute: entry.mute
         })
       }
     }
@@ -43,12 +93,18 @@ BarWidget {
   }
   readonly property var rooms: activeHousehold ? activeHousehold.rooms : []
   property bool popupOpen: false
-  property real maxLabelWidth: 190
+  property real maxLabelWidth: 220
   property var stagedRoomUids: []
   property bool groupingDirty: false
   property bool groupingApplying: false
+  property bool groupSettingsOpen: false
+  property bool locationPickerOpen: false
+  property bool playbackSessionsOpen: false
+  property bool favoritesOpen: false
+  readonly property bool opened: popupOpen
 
   function hasAction(name) { return actions.indexOf(name) !== -1 }
+  function open() { popupOpen = true }
   function close() { popupOpen = false }
   function resetStagedRooms() {
     stagedRoomUids = target && target.memberUids ? target.memberUids.slice() : []
@@ -74,6 +130,21 @@ BarWidget {
     groupingApplying = true
     sonos.applyMembers(stagedRoomUids)
   }
+  function movePlaybackTo(roomUid) {
+    if (!sonos || !roomUid) return
+    sonos.movePlaybackToRoom(roomUid)
+  }
+  function roomMoveBlocked(uid) {
+    if (!playing) return false
+    if (target && target.memberUids && target.memberUids.length > 1) return true
+    for (var i = 0; i < groups.length; i++) {
+      var group = groups[i]
+      if (!group.memberUids || group.memberUids.length < 2) continue
+      if (group.memberUids.indexOf(uid) === -1) continue
+      return true
+    }
+    return false
+  }
   function formatTime(seconds) {
     if (seconds === null || seconds === undefined || !isFinite(Number(seconds))) return "--:--"
     var total = Math.max(0, Math.floor(Number(seconds)))
@@ -90,10 +161,13 @@ BarWidget {
     groupingApplying = false
     if (!groupingDirty || finishedApply) resetStagedRooms()
   }
+  onMovePendingChanged: {
+    if (!movePending && sonos && sonos.moveError === "") locationPickerOpen = false
+  }
 
   implicitWidth: row.implicitWidth + Style.space(14)
   implicitHeight: barSize
-  opacity: online ? 1.0 : 0.52
+  opacity: online ? 1.0 : 0.68
 
   Row {
     id: row
@@ -117,24 +191,38 @@ BarWidget {
       anchors.verticalCenter: parent.verticalCenter
       visible: !root.bar.vertical
 
-      Text {
-        id: labelText
-        text: root.online
-          ? (root.title || root.roomLabel) + (root.artist ? "  ·  " + root.artist : "")
-          : "Sonos offline"
-        color: root.bar.barForeground
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.body
+      Row {
+        id: marqueeRow
         anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(18)
 
-        readonly property bool needsScroll: implicitWidth > scrollClip.width
+        Text {
+          id: labelText
+          text: root.barLabel
+          color: root.bar.barForeground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          text: root.barLabel
+          visible: labelText.implicitWidth > scrollClip.width
+          color: root.bar.barForeground
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
         NumberAnimation on x {
-          running: labelText.needsScroll && !root.popupOpen && !root.bar.vertical
+          id: marquee
+          running: labelText.implicitWidth > scrollClip.width
+            && !root.popupOpen && !root.bar.vertical
           loops: Animation.Infinite
-          duration: Math.max(6500, labelText.implicitWidth * 28)
-          from: scrollClip.width
-          to: -labelText.implicitWidth
+          from: 0
+          to: -(labelText.implicitWidth + marqueeRow.spacing)
+          duration: Math.max(4000,
+            (labelText.implicitWidth + marqueeRow.spacing) * 32)
           easing.type: Easing.Linear
+          onRunningChanged: if (!running) marqueeRow.x = 0
         }
       }
     }
@@ -163,7 +251,7 @@ BarWidget {
       root,
       root.online
         ? (root.roomLabel + " · " + (root.title || (root.playing ? "Playing" : "Paused")))
-        : (root.sonos && root.sonos.snapshot.status ? root.sonos.snapshot.status.message : "Sonos offline")
+        : root.disconnectedDetail
     )
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
@@ -196,21 +284,22 @@ BarWidget {
           borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
 
           Image {
+            id: artworkImage
             anchors.fill: parent
             anchors.margins: Style.space(2)
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
             source: root.playback.artworkUrl || ""
-            visible: source !== ""
+            visible: status === Image.Ready
           }
 
           Text {
             anchors.centerIn: parent
-            text: "󰓃"
-            visible: !root.playback.artworkUrl
+            text: "♪"
+            visible: artworkImage.status !== Image.Ready
             color: root.bar.foreground
             font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.displayLarge
+            font.pixelSize: Style.font.displayLarge * 1.35
           }
         }
 
@@ -220,7 +309,7 @@ BarWidget {
 
           Text {
             width: parent.width
-            text: root.online ? (root.title || "Nothing playing") : "Sonos unavailable"
+            text: root.online ? (root.title || "Nothing playing") : root.disconnectedTitle
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.subtitle
@@ -238,7 +327,9 @@ BarWidget {
           }
           Text {
             width: parent.width
-            text: root.roomLabel + (root.playback.source ? " · " + root.playback.source : "")
+            text: root.online
+              ? root.roomLabel + (root.playback.source ? " · " + root.playback.source : "")
+              : "Local network connection"
             color: Qt.darker(root.bar.foreground, 1.55)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -254,6 +345,8 @@ BarWidget {
           && Number(root.playback.durationSec || 0) > 0
 
         PanelSlider {
+          id: groupVolume
+          property real sentValue: Number.NaN
           bar: root.bar
           width: parent.width
           minimum: 0
@@ -284,10 +377,12 @@ BarWidget {
       Row {
         anchors.horizontalCenter: parent.horizontalCenter
         spacing: Style.space(6)
+        visible: root.online
 
         Button {
           iconText: "󰒮"
           foreground: root.bar.foreground
+          iconSize: Style.font.display
           enabled: root.online && root.hasAction("Previous")
           opacity: enabled ? 1.0 : 0.4
           onClicked: root.sonos.previous()
@@ -295,7 +390,7 @@ BarWidget {
         Button {
           iconText: root.playing ? "󰏤" : "󰐊"
           foreground: root.bar.foreground
-          iconSize: Style.font.iconLarge
+          iconSize: Style.font.displayLarge
           enabled: root.online && (root.hasAction("Play") || root.hasAction("Pause"))
           opacity: enabled ? 1.0 : 0.4
           onClicked: root.sonos.playPause()
@@ -303,17 +398,22 @@ BarWidget {
         Button {
           iconText: "󰒭"
           foreground: root.bar.foreground
+          iconSize: Style.font.display
           enabled: root.online && root.hasAction("Next")
           opacity: enabled ? 1.0 : 0.4
           onClicked: root.sonos.next()
         }
       }
 
-      PanelSeparator { foreground: root.bar.foreground }
+      PanelSeparator {
+        visible: root.online
+        foreground: root.bar.foreground
+      }
 
       Row {
         width: parent.width
         spacing: Style.space(8)
+        visible: root.online
 
         Text {
           anchors.verticalCenter: parent.verticalCenter
@@ -324,7 +424,6 @@ BarWidget {
         }
 
         PanelSlider {
-          id: groupVolume
           bar: root.bar
           width: parent.width - Style.space(66)
           minimum: 0
@@ -332,7 +431,17 @@ BarWidget {
           step: 5
           value: root.target ? Number(root.target.volume || 0) : 0
           enabled: root.online
-          onMoved: function(v) { root.sonos.setGroupVolume(v) }
+          onMoved: function(v) {
+            if (isNaN(groupVolume.sentValue)) {
+              groupVolume.sentValue = v
+              root.sonos.setGroupVolume(v)
+            }
+          }
+          onReleased: function(v) {
+            if (isNaN(groupVolume.sentValue) || Math.abs(groupVolume.sentValue - v) >= 1)
+              root.sonos.setGroupVolume(v)
+            groupVolume.sentValue = Number.NaN
+          }
         }
 
         Button {
@@ -343,12 +452,34 @@ BarWidget {
         }
       }
 
-      Text {
+      Column {
         width: parent.width
         visible: !root.online
-        text: root.sonos && root.sonos.lastError
-          ? root.sonos.lastError
-          : (root.sonos && root.sonos.snapshot.status ? root.sonos.snapshot.status.message : "Looking for Sonos…")
+        spacing: Style.space(8)
+
+        Text {
+          width: parent.width
+          text: root.disconnectedDetail
+          color: root.connectionProblem ? Color.urgent : Qt.darker(root.bar.foreground, 1.35)
+          wrapMode: Text.Wrap
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Button {
+          text: root.connectionState === "discovering" ? "Checking…" : "Check again"
+          foreground: root.bar.foreground
+          bordered: true
+          enabled: root.sonos && root.connectionState !== "discovering"
+          onClicked: root.sonos.refresh()
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: root.online && root.sonos && root.sonos.lastError
+          && root.sonos.favoriteError === "" && root.sonos.moveError === ""
+        text: root.sonos ? root.sonos.lastError : ""
         color: Color.urgent
         wrapMode: Text.Wrap
         font.family: root.bar.fontFamily
@@ -358,27 +489,229 @@ BarWidget {
       Column {
         width: parent.width
         spacing: Style.space(5)
-        visible: root.online && root.allGroups.length > 1
+        visible: root.online
 
-        Text {
-          text: "Groups"
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
+        Button {
+          width: parent.width
+          text: root.movePending
+            ? (root.playing ? "Moving audio…" : "Changing room…")
+            : (root.playing ? "Playing on: " : "Active room: ") + root.roomLabel
+          iconText: root.movePending ? "󰑓" : "󰓃"
+          foreground: root.bar.foreground
+          bordered: true
+          leftAlign: true
+          active: root.locationPickerOpen
+          enabled: !root.movePending
+          tooltipText: root.playing
+            ? "Choose where the current audio plays"
+            : "Choose which room to control"
+          onClicked: root.locationPickerOpen = !root.locationPickerOpen
         }
 
-        Repeater {
-          model: root.allGroups
-          Button {
-            required property var modelData
+        Column {
+          width: parent.width
+          spacing: Style.space(5)
+          visible: root.locationPickerOpen
+
+          Text {
+            text: root.playing
+              ? "Move current audio to a room"
+              : "Choose a room to control"
+            color: Qt.darker(root.bar.foreground, 1.35)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
             width: parent.width
-            text: modelData.label + (root.sonos.households.length > 1
-              ? "  ·  " + modelData.householdId : "")
+            visible: root.playing && root.target && root.target.memberUids.length > 1
+            text: "This audio is currently grouped. Use Group settings to change membership first."
+            color: root.bar.foreground
+            wrapMode: Text.Wrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Flow {
+            width: parent.width
+            spacing: Style.space(5)
+
+            Repeater {
+              model: root.rooms
+              Button {
+                required property var modelData
+                readonly property bool isCurrent: root.playing
+                  ? root.target && root.target.memberUids.length === 1
+                    && root.target.memberUids[0] === modelData.uid
+                  : root.selectedRoomUid === modelData.uid
+                readonly property bool moveBlocked: root.roomMoveBlocked(modelData.uid)
+                text: modelData.name
+                foreground: root.bar.foreground
+                bordered: true
+                active: isCurrent
+                enabled: !root.movePending && !isCurrent && !moveBlocked
+                tooltipText: isCurrent
+                  ? (root.playing ? "Current playback location" : "Active room")
+                  : moveBlocked
+                    ? "This room is in another group; change it in Group settings"
+                    : (root.playing ? "Move current audio here" : "Control this room")
+                onClicked: root.movePlaybackTo(modelData.uid)
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.sonos && root.sonos.moveError !== ""
+            text: root.sonos ? root.sonos.moveError : ""
+            color: root.bar.foreground
+            wrapMode: Text.Wrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(5)
+        visible: root.online && root.allGroups.length > 1
+
+        Button {
+          width: parent.width
+          text: root.playbackSessionsOpen ? "Hide other playback sessions" : "Control different audio"
+          iconText: "󰓃"
+          foreground: root.bar.foreground
+          bordered: true
+          leftAlign: true
+          active: root.playbackSessionsOpen
+          tooltipText: "Switch controls without moving audio"
+          onClicked: root.playbackSessionsOpen = !root.playbackSessionsOpen
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(5)
+          visible: root.playbackSessionsOpen
+
+          Text {
+            text: "This switches the controls; it does not move audio."
+            color: Qt.darker(root.bar.foreground, 1.35)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.allGroups
+            Button {
+              required property var modelData
+              width: parent.width
+              text: modelData.label + (root.serviceSnapshot.households.length > 1
+                ? "  ·  " + modelData.householdId : "")
+              foreground: root.bar.foreground
+              bordered: true
+              active: root.target && modelData.uid === root.target.groupUid
+              onClicked: {
+                root.sonos.selectGroup(modelData.uid)
+                root.playbackSessionsOpen = false
+              }
+            }
+          }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(5)
+        visible: root.online
+
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Button {
+            width: parent.width - refreshFavoritesButton.width - parent.spacing
+            text: root.favoritesOpen
+              ? "Hide Favorites"
+              : "Favorites" + (root.favorites.items.length > 0
+                ? "  ·  " + root.favorites.items.length : "")
+            iconText: "󰓎"
             foreground: root.bar.foreground
             bordered: true
-            active: root.target && modelData.uid === root.target.groupUid
-            onClicked: root.sonos.selectGroup(modelData.uid)
+            leftAlign: true
+            active: root.favoritesOpen
+            onClicked: root.favoritesOpen = !root.favoritesOpen
+          }
+
+          Button {
+            id: refreshFavoritesButton
+            iconText: "󰑐"
+            tooltipText: "Refresh Sonos Favorites"
+            foreground: root.bar.foreground
+            onClicked: root.sonos.refreshFavorites()
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(5)
+          visible: root.favoritesOpen
+
+          Text {
+            width: parent.width
+            visible: root.favoriteStarting
+            text: root.favoriteStartingTitle !== ""
+              ? "Starting " + root.favoriteStartingTitle + "…" : ""
+            color: Qt.darker(root.bar.foreground, 1.25)
+            elide: Text.ElideRight
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width
+            visible: root.sonos && root.sonos.favoriteError !== ""
+            text: root.sonos ? root.sonos.favoriteError : ""
+            color: root.bar.foreground
+            wrapMode: Text.Wrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width
+            visible: root.favorites.state === "error"
+              || root.favorites.items.length === 0
+              || root.favorites.unsupported > 0
+            text: root.favorites.state === "error"
+              ? "Favorites unavailable: " + root.favorites.error
+              : root.favorites.items.length === 0
+                ? "No directly playable Favorites found."
+                : root.favorites.unsupported + " saved item"
+                  + (root.favorites.unsupported === 1 ? "" : "s")
+                  + " omitted because Sonos did not provide a playable source."
+            color: Qt.darker(root.bar.foreground, 1.35)
+            wrapMode: Text.Wrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.favorites.items
+            Button {
+              required property var modelData
+              width: parent.width
+              text: modelData.title
+              iconText: modelData.kind === "radio" ? "󰎆" : "󰝚"
+              foreground: root.bar.foreground
+              bordered: true
+              leftAlign: true
+              enabled: !root.favoriteStarting
+              tooltipText: "Play on " + root.roomLabel
+              onClicked: {
+                root.sonos.playFavorite(modelData.id, modelData.title)
+              }
+            }
           }
         }
       }
@@ -407,27 +740,87 @@ BarWidget {
           Row {
             id: roomRow
             required property var modelData
+            readonly property string playbackState: String(
+              modelData.playbackState || "STOPPED"
+            ).toUpperCase()
+            readonly property bool audioPlaying: playbackState === "PLAYING"
             width: roomMixer.width
             spacing: Style.space(6)
 
-            Text {
-              width: Style.space(92)
+            Row {
+              id: roomIdentity
+              width: Style.space(116)
               anchors.verticalCenter: parent.verticalCenter
-              text: roomRow.modelData.name
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              elide: Text.ElideRight
+              spacing: Style.space(4)
+
+              Text {
+                width: Math.min(implicitWidth,
+                  roomIdentity.width - playingBadge.width - roomIdentity.spacing)
+                anchors.verticalCenter: parent.verticalCenter
+                text: roomRow.modelData.name
+                color: roomRow.audioPlaying ? Color.accent : root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: roomRow.audioPlaying
+                elide: Text.ElideRight
+              }
+
+              Item {
+                id: playingBadge
+                width: Style.space(20)
+                height: Style.space(20)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  anchors.centerIn: parent
+                  visible: roomRow.audioPlaying
+                  text: "♪"
+                  color: Color.accent
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.iconLarge
+                  font.bold: true
+                }
+
+                SequentialAnimation on opacity {
+                  running: roomRow.audioPlaying
+                  loops: Animation.Infinite
+                  NumberAnimation {
+                    from: 1.0
+                    to: 0.52
+                    duration: 720
+                    easing.type: Easing.InOutSine
+                  }
+                  NumberAnimation {
+                    from: 0.52
+                    to: 1.0
+                    duration: 720
+                    easing.type: Easing.InOutSine
+                  }
+                  onRunningChanged: if (!running) playingBadge.opacity = 1.0
+                }
+              }
             }
 
             PanelSlider {
+              id: roomVolume
+              property real sentValue: Number.NaN
               bar: root.bar
-              width: roomMixer.width - Style.space(142)
+              width: roomMixer.width - Style.space(166)
               minimum: 0
               maximum: 100
               step: 5
               value: Number(roomRow.modelData.volume || 0)
-              onMoved: function(v) { root.sonos.setRoomVolume(roomRow.modelData.uid, v) }
+              onMoved: function(v) {
+                if (isNaN(roomVolume.sentValue)) {
+                  roomVolume.sentValue = v
+                  root.sonos.setRoomVolume(roomRow.modelData.uid, v)
+                }
+              }
+              onReleased: function(v) {
+                if (isNaN(roomVolume.sentValue) || Math.abs(roomVolume.sentValue - v) >= 1)
+                  root.sonos.setRoomVolume(roomRow.modelData.uid, v)
+                roomVolume.sentValue = Number.NaN
+              }
             }
 
             Button {
@@ -438,56 +831,69 @@ BarWidget {
           }
         }
 
-        Text {
-          text: "Group rooms"
-          color: Qt.darker(root.bar.foreground, 1.35)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          font.bold: true
+        Button {
+          text: root.groupSettingsOpen ? "Hide group settings" : "Group settings"
+          iconText: "󰒓"
+          foreground: root.bar.foreground
+          bordered: true
+          onClicked: root.groupSettingsOpen = !root.groupSettingsOpen
         }
 
-        Flow {
+        Column {
           width: parent.width
           spacing: Style.space(5)
+          visible: root.groupSettingsOpen
 
-          Repeater {
-            model: root.rooms
-            Button {
-              required property var modelData
-              text: modelData.name
-              foreground: root.bar.foreground
-              bordered: true
-              active: root.roomStaged(modelData.uid)
-              onClicked: root.toggleStagedRoom(modelData.uid)
+          Text {
+            text: "Create or change the controlled group"
+            color: Qt.darker(root.bar.foreground, 1.35)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Flow {
+            width: parent.width
+            spacing: Style.space(5)
+
+            Repeater {
+              model: root.rooms
+              Button {
+                required property var modelData
+                text: modelData.name
+                foreground: root.bar.foreground
+                bordered: true
+                active: root.roomStaged(modelData.uid)
+                onClicked: root.toggleStagedRoom(modelData.uid)
+              }
             }
           }
-        }
 
-        Row {
-          width: parent.width
-          spacing: Style.space(6)
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
 
-          Button {
-            text: "Everywhere"
-            foreground: root.bar.foreground
-            bordered: true
-            enabled: !root.groupingApplying
-            onClicked: root.stageEverywhere()
-          }
-          Button {
-            text: "Cancel"
-            foreground: root.bar.foreground
-            bordered: true
-            enabled: root.groupingDirty && !root.groupingApplying
-            onClicked: root.resetStagedRooms()
-          }
-          Button {
-            text: root.groupingApplying ? "Applying…" : "Apply"
-            foreground: root.bar.foreground
-            bordered: true
-            active: root.groupingDirty
-            enabled: root.groupingDirty && root.stagedRoomUids.length > 0 && !root.groupingApplying
-            onClicked: root.applyStagedRooms()
+            Button {
+              text: "Everywhere"
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: !root.groupingApplying
+              onClicked: root.stageEverywhere()
+            }
+            Button {
+              text: "Cancel"
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: root.groupingDirty && !root.groupingApplying
+              onClicked: root.resetStagedRooms()
+            }
+            Button {
+              text: root.groupingApplying ? "Applying…" : "Apply"
+              foreground: root.bar.foreground
+              bordered: true
+              active: root.groupingDirty
+              enabled: root.groupingDirty && root.stagedRoomUids.length > 0 && !root.groupingApplying
+              onClicked: root.applyStagedRooms()
+            }
           }
         }
       }

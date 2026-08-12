@@ -17,6 +17,7 @@ Item {
     targetGroupUid: "",
     households: [],
     target: null,
+    favorites: { state: "not_loaded", items: [], total: 0, unsupported: 0, error: "" },
     playback: {
       state: "STOPPED",
       title: "",
@@ -33,6 +34,12 @@ Item {
   property int requestCounter: 0
   property int restartAttempt: 0
   property bool expectedStop: false
+  property string favoriteRequestId: ""
+  property string favoriteStartingTitle: ""
+  property bool favoriteAwaitingSnapshot: false
+  property string favoriteError: ""
+  property string moveRequestId: ""
+  property string moveError: ""
 
   readonly property bool ready: snapshot && snapshot.status && snapshot.status.state === "ready"
   readonly property var playback: snapshot && snapshot.playback ? snapshot.playback : ({})
@@ -67,6 +74,20 @@ Item {
   function next() { sendCommand("next") }
   function previous() { sendCommand("previous") }
   function seek(positionSec) { sendCommand("seek", { positionSec: positionSec }) }
+  function playFavorite(favoriteId, title) {
+    if (favoriteRequestId !== "" || favoriteAwaitingSnapshot) return ""
+    favoriteStartingTitle = String(title || "Favorite")
+    favoriteError = ""
+    favoriteRequestId = sendCommand("playFavorite", { favoriteId: favoriteId })
+    return favoriteRequestId
+  }
+  function refreshFavorites() { sendCommand("refreshFavorites") }
+  function movePlaybackToRoom(roomUid) {
+    if (moveRequestId !== "") return ""
+    moveError = ""
+    moveRequestId = sendCommand("movePlaybackToRoom", { roomUid: roomUid })
+    return moveRequestId
+  }
   function selectGroup(groupUid) { sendCommand("selectGroup", { groupUid: groupUid }) }
   function setGroupVolume(volume) { sendCommand("setGroupVolume", { volume: volume }) }
   function adjustGroupVolume(delta) { sendCommand("adjustGroupVolume", { delta: delta }) }
@@ -88,12 +109,35 @@ Item {
     }
     if (message.type === "snapshot") {
       snapshot = message
+      if (favoriteAwaitingSnapshot) {
+        favoriteAwaitingSnapshot = false
+        favoriteStartingTitle = ""
+      }
       return
     }
     if (message.type === "result" && message.ok === false) {
       lastError = String(message.error || "Sonos command failed")
+      if (String(message.id || "") === moveRequestId) {
+        moveError = lastError
+        moveRequestId = ""
+      }
+      if (String(message.id || "") === favoriteRequestId) {
+        favoriteError = "Could not start " + favoriteStartingTitle + ": "
+          + String(message.error || "Sonos command failed")
+        favoriteRequestId = ""
+        favoriteAwaitingSnapshot = false
+        favoriteStartingTitle = ""
+      }
     } else if (message.type === "result" && message.ok === true) {
       lastError = ""
+      if (String(message.id || "") === moveRequestId) {
+        moveError = ""
+        moveRequestId = ""
+      }
+      if (String(message.id || "") === favoriteRequestId) {
+        favoriteRequestId = ""
+        favoriteAwaitingSnapshot = true
+      }
     }
   }
 

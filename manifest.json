@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ctl0v0.omasonos",
   "name": "OmaSonos",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "ctl0v0",
   "description": "Local-first Sonos control for the Omarchy bar",
   "kinds": [

@@ -8,7 +8,8 @@ class FakeController:
     def __init__(self):
         self.calls = []
 
-    def refresh(self):
+    def refresh(self, *, rediscover=True):
+        self.calls.append(("refresh", rediscover))
         return {
             "type": "snapshot",
             "version": 1,
@@ -18,11 +19,21 @@ class FakeController:
             "playback": {},
         }
 
+    def event_services(self):
+        return {}
+
     def play_pause(self):
         self.calls.append(("playPause",))
 
     def set_group_volume(self, volume):
         self.calls.append(("setGroupVolume", volume))
+
+    def play_favorite(self, favorite_id):
+        self.calls.append(("playFavorite", favorite_id))
+
+    def move_playback_to_room(self, room_uid):
+        self.calls.append(("movePlaybackToRoom", room_uid))
+
 
 
 def decoded(output):
@@ -35,7 +46,7 @@ def test_mutation_emits_result_then_fresh_snapshot():
     output = io.StringIO()
     server.handle({"id": "12", "op": "playPause"}, output)
     messages = decoded(output)
-    assert controller.calls == [("playPause",)]
+    assert controller.calls == [("playPause",), ("refresh", False)]
     assert messages[0] == {"type": "result", "id": "12", "ok": True}
     assert messages[1]["type"] == "snapshot"
 
@@ -65,13 +76,33 @@ def test_plan_style_top_level_arguments_are_used():
     server = ProtocolServer(controller)  # type: ignore[arg-type]
     output = io.StringIO()
     server.handle({"id": "3", "op": "setGroupVolume", "volume": 35}, output)
-    assert controller.calls == [("setGroupVolume", 35)]
+    assert controller.calls == [("setGroupVolume", 35), ("refresh", False)]
+    assert decoded(output)[0]["ok"] is True
+
+
+def test_play_favorite_dispatches_opaque_id():
+    controller = FakeController()
+    server = ProtocolServer(controller)  # type: ignore[arg-type]
+    output = io.StringIO()
+    server.handle({"id": "4", "op": "playFavorite", "favoriteId": "fav-1"}, output)
+    assert controller.calls == [("playFavorite", "fav-1"), ("refresh", False)]
+    assert decoded(output)[0]["ok"] is True
+
+
+def test_move_playback_dispatches_dedicated_room_operation():
+    controller = FakeController()
+    server = ProtocolServer(controller)  # type: ignore[arg-type]
+    output = io.StringIO()
+    server.handle(
+        {"id": "5", "op": "movePlaybackToRoom", "roomUid": "R2"}, output
+    )
+    assert controller.calls == [("movePlaybackToRoom", "R2"), ("refresh", False)]
     assert decoded(output)[0]["ok"] is True
 
 
 def test_refresh_exception_becomes_error_snapshot():
     class BrokenController(FakeController):
-        def refresh(self):
+        def refresh(self, *, rediscover=True):
             raise RuntimeError("network exploded")
 
     server = ProtocolServer(BrokenController())  # type: ignore[arg-type]

@@ -25,11 +25,11 @@ The frontend must treat the snapshot as authoritative after mutations.
 
 ## Not yet release-complete
 
-- Event subscriptions and callback-port fallback logic are not implemented yet;
-  milestone 1 polls every 2 seconds while the card is open and every 10 seconds
-  while closed.
+- Topology, transport, group-volume, and room-rendering event subscriptions are
+  implemented with a 75 ms event-burst window. Incomplete subscriptions fall
+  back to polling; healthy event mode retains slower 10/30-second safety polls.
 - The QML group picker, room mixer, staged grouping view, and seek UI are in
   place, but the full keyboard model and large-household layout still need work.
 - `requirements.lock` is exact-pinned but not yet transitive/hash-locked.
-- Real Sonos S2 hardware scenarios from `PLAN.md` have not been exercised from
-  this build environment.
+- Discovery, callback reachability, and basic controller operations work on the
+  six-room Sonos S2 household; the full hardware scenario matrix remains.

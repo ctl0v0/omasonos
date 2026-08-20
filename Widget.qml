@@ -538,6 +538,7 @@ BarWidget {
           id: groupVolume
           property real sentValue: Number.NaN
           bar: root.bar
+          anchors.verticalCenter: parent.verticalCenter
           width: parent.width - Style.space(66)
           minimum: 0
           maximum: 100
@@ -903,6 +904,7 @@ BarWidget {
               id: roomVolume
               property real sentValue: Number.NaN
               bar: root.bar
+              anchors.verticalCenter: parent.verticalCenter
               width: roomMixer.width - Style.space(166)
               minimum: 0
               maximum: 100

@@ -17,8 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out Omarchy validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: basecamp/omarchy
+          ref: 945549699026df6c888a6b1bd4e06fbf55a67595
+          path: .omarchy-validation
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.14'
           cache: pip
@@ -32,6 +38,8 @@ jobs:
       - name: Python syntax
         run: python -m compileall -q sonos_service.py omasonos_backend scripts/smoke-backend.py
       - name: Shell syntax
-        run: bash -n sonos-backend scripts/install-local.sh scripts/test-local.sh
-      - name: Manifest contract
-        run: python tests/validate_manifest.py
+        run: bash -n sonos-backend scripts/install-local.sh scripts/lint-qml.sh scripts/stage-plugin.sh scripts/test-local.sh scripts/validate-plugin.sh
+      - name: Omarchy plugin contract
+        env:
+          OMARCHY_PLUGIN_VALIDATOR: ${{ github.workspace }}/.omarchy-validation/bin/omarchy-plugin-validate
+        run: ./scripts/validate-plugin.sh

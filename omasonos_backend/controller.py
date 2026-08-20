@@ -1559,7 +1559,7 @@ class SonosController:
 
             # Sonos may leave the old coordinator playing by itself after it
             # becomes a standalone group. Stop it only after topology confirms
-            # that detachment, matching the safety rule in PLAN.md.
+            # that detachment.
             detached_is_standalone = False
             for household in final.get("households", []):
                 if household.get("id") != target["householdId"]:

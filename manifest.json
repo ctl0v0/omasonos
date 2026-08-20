@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "id": "io.github.ctl0v0.omasonos",
   "name": "OmaSonos",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "ctl0v0",
+  "license": "MIT",
   "description": "Local-first Sonos control for the Omarchy bar",
   "kinds": [
     "service",
     "bar-widget"
   ],
-  "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml",
     "barWidget": "Widget.qml"
@@ -19,6 +19,21 @@
     "description": "Sonos now-playing, playback, volume, groups, and rooms",
     "category": "Media",
     "defaultSection": "right",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaults": {
+      "maxLabelWidth": 220
+    },
+    "schema": [
+      {
+        "key": "maxLabelWidth",
+        "type": "integer",
+        "label": "Maximum label width",
+        "description": "Maximum width of the now-playing label in pixels.",
+        "min": 80,
+        "max": 500,
+        "step": 20,
+        "defaultValue": 220
+      }
+    ]
   }
 }

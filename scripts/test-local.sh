@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 PLUGIN_ID="io.github.ctl0v0.omasonos"
@@ -12,8 +12,16 @@ for cmd in omarchy omarchy-shell python3 jq; do
 done
 
 echo "== Manifest =="
-omarchy plugin validate "$ROOT"
+"$ROOT/scripts/validate-plugin.sh"
 echo "ok"
+
+echo
+echo "== QML =="
+if [[ -n ${OMARCHY_PATH:-} ]] && { command -v qmllint >/dev/null 2>&1 || [[ -x /usr/lib/qt6/bin/qmllint ]]; }; then
+  "$ROOT/scripts/lint-qml.sh"
+else
+  echo "qmllint or OMARCHY_PATH unavailable; skipping QML lint"
+fi
 
 echo
 echo "== Python tests =="

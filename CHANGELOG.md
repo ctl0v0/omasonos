@@ -2,6 +2,20 @@
 
 All notable changes to OmaSonos are documented here.
 
+## [0.2.1] - 2026-08-19
+
+### Fixed
+
+- Preserved command, setup, and degraded-network errors until users can act on them.
+- Stopped retrying failed dependency setup in a background loop; retry is now explicit.
+- Added keyboard operation and scrolling for long controller panels.
+- Aggregated panel-open state across monitors for the shared backend service.
+- Validated and installed from a clean staged plugin using Omarchy's official contract.
+
+### Removed
+
+- Removed internal build plans and implementation-review notes from the release tree.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

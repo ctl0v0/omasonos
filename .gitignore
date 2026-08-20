@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .venv/
 venv/
+.omarchy-validation/
 .DS_Store
 *.log
 .coverage

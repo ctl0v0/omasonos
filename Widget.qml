@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Ui
 import qs.Commons
@@ -16,9 +17,14 @@ BarWidget {
     ? String(serviceSnapshot.selectedAnchorRoomUid || "") : ""
   readonly property var favorites: serviceSnapshot && serviceSnapshot.favorites
     ? serviceSnapshot.favorites : ({ state: "not_loaded", items: [], total: 0, unsupported: 0, error: "" })
-  readonly property bool online: sonos && sonos.ready && target !== null
+  readonly property bool online: !!sonos && sonos.ready && target !== null
   readonly property string connectionState: serviceSnapshot && serviceSnapshot.status
     ? String(serviceSnapshot.status.state || "starting") : "starting"
+  readonly property var connectionStatus: serviceSnapshot && serviceSnapshot.status
+    ? serviceSnapshot.status : ({})
+  readonly property bool degraded: connectionStatus.degraded === true
+    || playback.stale === true
+  readonly property string statusMessage: String(connectionStatus.message || "")
   readonly property bool connectionProblem: connectionState === "error"
     || connectionState === "setup_error"
   readonly property string disconnectedTitle: connectionProblem
@@ -35,9 +41,9 @@ BarWidget {
     : (connectionState === "starting" || connectionState === "discovering"
       ? "Checking this network for your speakers…"
       : "You’re not on your Sonos network. OmaSonos will reconnect automatically when you’re back on the same Wi-Fi.")
-  readonly property bool favoriteStarting: sonos
+  readonly property bool favoriteStarting: !!sonos
     && (sonos.favoriteRequestId !== "" || sonos.favoriteAwaitingSnapshot)
-  readonly property bool movePending: sonos && sonos.moveRequestId !== ""
+  readonly property bool movePending: !!sonos && sonos.moveRequestId !== ""
   readonly property string favoriteStartingTitle: sonos
     ? String(sonos.favoriteStartingTitle || "") : ""
   readonly property string playbackState: String(playback.state || "").toUpperCase()
@@ -104,7 +110,7 @@ BarWidget {
   }
   readonly property var rooms: activeHousehold ? activeHousehold.rooms : []
   property bool popupOpen: false
-  property real maxLabelWidth: 220
+  readonly property real maxLabelWidth: Math.max(80, Number(setting("maxLabelWidth", 220)))
   property var stagedRoomUids: []
   property bool groupingDirty: false
   property bool groupingApplying: false
@@ -112,11 +118,62 @@ BarWidget {
   property bool locationPickerOpen: false
   property bool playbackSessionsOpen: false
   property bool favoritesOpen: false
+  property bool popoutSwitchClosing: false
+  property var focusedControl: null
   readonly property bool opened: popupOpen
 
   function hasAction(name) { return actions.indexOf(name) !== -1 }
   function open() { popupOpen = true }
   function close() { popupOpen = false }
+  function toggle() { popupOpen = !popupOpen }
+  function closeForPopoutSwitch() {
+    popoutSwitchClosing = true
+    close()
+    popoutSwitchTimer.restart()
+  }
+  function switchPanel(direction) {
+    if (bar && typeof bar.switchPanelFrom === "function")
+      return bar.switchPanelFrom(root, direction)
+    return false
+  }
+  function safeArtworkUrl(url) {
+    var value = String(url || "").trim()
+    return value.indexOf("http://") === 0 || value.indexOf("https://") === 0
+      ? value : ""
+  }
+  function activeControl() {
+    var window = keyCatcher.QsWindow.window
+    var item = window ? window.activeFocusItem : null
+    return item && item.focusable === true ? item : focusedControl
+  }
+  function moveControlFocus(forward) {
+    var current = activeControl() || keyCatcher
+    var next = current
+    for (var i = 0; i < 100; i++) {
+      next = next.nextItemInFocusChain(forward)
+      if (!next || next === current) return
+      if (next.focusable === true && next.enabled && next.visible) {
+        focusedControl = next
+        next.forceActiveFocus()
+        var point = next.mapToItem(content, 0, 0)
+        if (point.y < panelScroll.contentY)
+          panelScroll.contentY = Math.max(0, point.y - Style.spacing.panelGap)
+        else if (point.y + next.height > panelScroll.contentY + panelScroll.height)
+          panelScroll.contentY = Math.min(
+            Math.max(0, panelScroll.contentHeight - panelScroll.height),
+            point.y + next.height - panelScroll.height + Style.spacing.panelGap)
+        return
+      }
+    }
+  }
+  function activateFocusedControl() {
+    var current = activeControl()
+    if (current && current.enabled && current.visible && "clicked" in current) {
+      current.clicked()
+      return
+    }
+    if (online && (hasAction("Play") || hasAction("Pause"))) sonos.playPause()
+  }
   function resetStagedRooms() {
     stagedRoomUids = target && target.memberUids ? target.memberUids.slice() : []
     groupingDirty = false
@@ -239,49 +296,90 @@ BarWidget {
     }
   }
 
-  MouseArea {
+  WidgetButton {
+    id: barButton
     anchors.fill: parent
-    hoverEnabled: true
-    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
-    cursorShape: Qt.PointingHandCursor
+    bar: root.bar
+    text: " "
+    labelVisible: false
+    tooltipText: root.online
+      ? (root.roomLabel + " · " + (root.title || (root.playing ? "Playing" : "Paused")))
+      : root.disconnectedDetail
 
-    onClicked: function(mouse) {
-      if (mouse.button === Qt.MiddleButton) {
+    onPressed: function(button) {
+      if (button === Qt.MiddleButton) {
         if (root.online) root.sonos.playPause()
-      } else {
-        root.popupOpen = !root.popupOpen
+      } else if (button === Qt.LeftButton) {
+        root.toggle()
       }
     }
 
-    onWheel: function(wheel) {
+    onWheelMoved: function(delta) {
       if (!root.online) return
-      root.sonos.adjustGroupVolume(wheel.angleDelta.y > 0 ? 5 : -5)
+      root.sonos.adjustGroupVolume(delta > 0 ? 5 : -5)
     }
-
-    onEntered: if (root.bar) root.bar.showTooltip(
-      root,
-      root.online
-        ? (root.roomLabel + " · " + (root.title || (root.playing ? "Playing" : "Paused")))
-        : root.disconnectedDetail
-    )
-    onExited: if (root.bar) root.bar.hideTooltip(root)
   }
 
-  onPopupOpenChanged: if (sonos) sonos.setPanelOpen(popupOpen)
+  onPopupOpenChanged: {
+    focusedControl = null
+    if (sonos) sonos.setPanelOpen(popupOpen)
+  }
+  Component.onDestruction: if (popupOpen && sonos) sonos.setPanelOpen(false)
 
-  PopupCard {
+  Timer {
+    id: popoutSwitchTimer
+    interval: 1
+    onTriggered: root.popoutSwitchClosing = false
+  }
+
+  KeyboardPanel {
     id: popup
-    anchorItem: root
+    anchorItem: barButton
     bar: root.bar
     owner: root
     open: root.popupOpen
+    focusTarget: keyCatcher
     contentWidth: popup.fittedContentWidth(Style.space(360))
-    contentHeight: popup.fittedContentHeight(content.implicitHeight)
+    contentHeight: popup.fittedContentHeight(content.implicitHeight, Style.space(640))
 
-    Column {
-      id: content
+    PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
-      spacing: Style.spacing.panelGap
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveControlFocus(dy > 0)
+        else if (dx !== 0 && root.online) root.sonos.adjustGroupVolume(dx * 5)
+      }
+      onActivateRequested: root.activateFocusedControl()
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(text) {
+        var key = String(text).toLowerCase()
+        if (!root.online) return
+        if (key === "n" && root.hasAction("Next")) root.sonos.next()
+        else if (key === "p" && root.hasAction("Previous")) root.sonos.previous()
+        else if (key === "m" && root.target) root.sonos.setGroupMute(!root.target.mute)
+        else if (key === "g") root.playbackSessionsOpen = !root.playbackSessionsOpen
+        else if (key === "r") root.groupSettingsOpen = !root.groupSettingsOpen
+      }
+
+      Flickable {
+        id: panelScroll
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: content.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar {
+          policy: content.implicitHeight > panelScroll.height
+            ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        }
+
+        Column {
+          id: content
+          width: panelScroll.width
+          spacing: Style.spacing.panelGap
 
       Row {
         width: parent.width
@@ -300,7 +398,7 @@ BarWidget {
             anchors.margins: Style.space(2)
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
-            source: root.playback.artworkUrl || ""
+            source: root.safeArtworkUrl(root.playback.artworkUrl)
             visible: status === Image.Ready
           }
 
@@ -356,8 +454,7 @@ BarWidget {
           && Number(root.playback.durationSec || 0) > 0
 
         PanelSlider {
-          id: groupVolume
-          property real sentValue: Number.NaN
+          id: seekProgress
           bar: root.bar
           width: parent.width
           minimum: 0
@@ -392,6 +489,7 @@ BarWidget {
 
         Button {
           iconText: "󰒮"
+          focusable: true
           foreground: root.bar.foreground
           iconSize: Style.font.display
           enabled: root.online && root.hasAction("Previous")
@@ -400,6 +498,7 @@ BarWidget {
         }
         Button {
           iconText: root.playing ? "󰏤" : "󰐊"
+          focusable: true
           foreground: root.bar.foreground
           iconSize: Style.font.displayLarge
           enabled: root.online && (root.hasAction("Play") || root.hasAction("Pause"))
@@ -408,6 +507,7 @@ BarWidget {
         }
         Button {
           iconText: "󰒭"
+          focusable: true
           foreground: root.bar.foreground
           iconSize: Style.font.display
           enabled: root.online && root.hasAction("Next")
@@ -435,6 +535,8 @@ BarWidget {
         }
 
         PanelSlider {
+          id: groupVolume
+          property real sentValue: Number.NaN
           bar: root.bar
           width: parent.width - Style.space(66)
           minimum: 0
@@ -457,6 +559,7 @@ BarWidget {
 
         Button {
           iconText: root.target && root.target.mute ? "󰝟" : "󰓄"
+          focusable: true
           foreground: root.bar.foreground
           enabled: root.online
           onClicked: root.sonos.setGroupMute(!(root.target && root.target.mute))
@@ -479,16 +582,29 @@ BarWidget {
 
         Button {
           text: root.connectionState === "discovering" ? "Checking…" : "Check again"
+          focusable: true
           foreground: root.bar.foreground
           bordered: true
-          enabled: root.sonos && root.connectionState !== "discovering"
+          enabled: !!root.sonos && root.connectionState !== "discovering"
           onClicked: root.sonos.refresh()
         }
       }
 
       Text {
         width: parent.width
-        visible: root.online && root.sonos && root.sonos.lastError
+        visible: root.online && root.degraded
+        text: root.statusMessage !== ""
+          ? "Using cached Sonos state: " + root.statusMessage
+          : "Using cached Sonos state while the network reconnects."
+        color: Color.urgent
+        wrapMode: Text.Wrap
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        width: parent.width
+        visible: root.online && !!root.sonos && root.sonos.lastError
           && root.sonos.favoriteError === "" && root.sonos.moveError === ""
         text: root.sonos ? root.sonos.lastError : ""
         color: Color.urgent
@@ -504,6 +620,7 @@ BarWidget {
 
         Button {
           width: parent.width
+          focusable: true
           text: root.movePending
             ? (root.playing ? "Moving audio…" : "Changing room…")
             : (root.playing ? "Playing on: " : "Active room: ") + root.roomLabel
@@ -551,6 +668,7 @@ BarWidget {
               model: root.rooms
               Button {
                 required property var modelData
+                focusable: true
                 readonly property bool isCurrent: root.playing
                   ? root.target && root.target.memberUids.length === 1
                     && root.target.memberUids[0] === modelData.uid
@@ -573,7 +691,7 @@ BarWidget {
 
           Text {
             width: parent.width
-            visible: root.sonos && root.sonos.moveError !== ""
+            visible: !!root.sonos && root.sonos.moveError !== ""
             text: root.sonos ? root.sonos.moveError : ""
             color: root.bar.foreground
             wrapMode: Text.Wrap
@@ -590,6 +708,7 @@ BarWidget {
 
         Button {
           width: parent.width
+          focusable: true
           text: root.playbackSessionsOpen ? "Hide other playback sessions" : "Control different audio"
           iconText: "󰓃"
           foreground: root.bar.foreground
@@ -616,6 +735,7 @@ BarWidget {
             model: root.allGroups
             Button {
               required property var modelData
+              focusable: true
               width: parent.width
               text: modelData.label + (root.serviceSnapshot.households.length > 1
                 ? "  ·  " + modelData.householdId : "")
@@ -642,6 +762,7 @@ BarWidget {
 
           Button {
             width: parent.width - refreshFavoritesButton.width - parent.spacing
+            focusable: true
             text: root.favoritesOpen
               ? "Hide Favorites"
               : "Favorites" + (root.favorites.items.length > 0
@@ -656,6 +777,7 @@ BarWidget {
 
           Button {
             id: refreshFavoritesButton
+            focusable: true
             iconText: "󰑐"
             tooltipText: "Refresh Sonos Favorites"
             foreground: root.bar.foreground
@@ -681,7 +803,7 @@ BarWidget {
 
           Text {
             width: parent.width
-            visible: root.sonos && root.sonos.favoriteError !== ""
+            visible: !!root.sonos && root.sonos.favoriteError !== ""
             text: root.sonos ? root.sonos.favoriteError : ""
             color: root.bar.foreground
             wrapMode: Text.Wrap
@@ -711,6 +833,7 @@ BarWidget {
             model: root.favorites.items
             Button {
               required property var modelData
+              focusable: true
               width: parent.width
               text: modelData.title
               iconText: modelData.kind === "radio" ? "󰎆"
@@ -800,6 +923,7 @@ BarWidget {
 
             Button {
               iconText: roomRow.modelData.mute ? "󰝟" : "󰓄"
+              focusable: true
               foreground: root.bar.foreground
               onClicked: root.sonos.setRoomMute(roomRow.modelData.uid, !roomRow.modelData.mute)
             }
@@ -808,6 +932,7 @@ BarWidget {
 
         Button {
           text: root.groupSettingsOpen ? "Hide group settings" : "Group settings"
+          focusable: true
           iconText: "󰒓"
           foreground: root.bar.foreground
           bordered: true
@@ -834,6 +959,7 @@ BarWidget {
               model: root.rooms
               Button {
                 required property var modelData
+                focusable: true
                 text: modelData.name
                 foreground: root.bar.foreground
                 bordered: true
@@ -849,6 +975,7 @@ BarWidget {
 
             Button {
               text: "Everywhere"
+              focusable: true
               foreground: root.bar.foreground
               bordered: true
               enabled: !root.groupingApplying
@@ -856,6 +983,7 @@ BarWidget {
             }
             Button {
               text: "Cancel"
+              focusable: true
               foreground: root.bar.foreground
               bordered: true
               enabled: root.groupingDirty && !root.groupingApplying
@@ -863,6 +991,7 @@ BarWidget {
             }
             Button {
               text: root.groupingApplying ? "Applying…" : "Apply"
+              focusable: true
               foreground: root.bar.foreground
               bordered: true
               active: root.groupingDirty
@@ -870,6 +999,8 @@ BarWidget {
               onClicked: root.applyStagedRooms()
             }
           }
+        }
+      }
         }
       }
     }

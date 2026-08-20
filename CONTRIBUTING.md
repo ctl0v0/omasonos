@@ -5,27 +5,31 @@ the process in [SECURITY.md](SECURITY.md).
 
 ## Development setup
 
-OmaSonos targets Python 3.14 on Omarchy Quattro. Create an isolated environment
-and install the runtime and test dependencies:
+OmaSonos targets Python 3.14 on Omarchy Quattro. Keep the development environment
+outside the plugin tree because Omarchy correctly rejects plugin directories that
+contain symlinks:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install pip==24.3.1
-.venv/bin/python -m pip install --require-hashes -r requirements.lock
-.venv/bin/python -m pip install pytest==9.1.1 pip-tools==7.5.0
+DEV_VENV="${XDG_CACHE_HOME:-$HOME/.cache}/omasonos-dev/venv"
+python3 -m venv "$DEV_VENV"
+"$DEV_VENV/bin/python" -m pip install pip==24.3.1
+"$DEV_VENV/bin/python" -m pip install --require-hashes -r requirements.lock
+"$DEV_VENV/bin/python" -m pip install pytest==9.1.1 pip-tools==7.5.0
 ```
 
-Run the checks used by CI:
+Run the automated and Omarchy-hosted checks:
 
 ```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q sonos_service.py omasonos_backend scripts/smoke-backend.py
-bash -n sonos-backend scripts/install-local.sh scripts/test-local.sh
-.venv/bin/python tests/validate_manifest.py
-omarchy plugin validate .
+"$DEV_VENV/bin/python" -m pytest -q
+"$DEV_VENV/bin/python" -m compileall -q sonos_service.py omasonos_backend scripts/smoke-backend.py
+bash -n sonos-backend scripts/*.sh
+./scripts/validate-plugin.sh
+./scripts/lint-qml.sh
 ```
 
-The final command requires Omarchy. Hardware-affecting tests should use a test
+The final two commands require Omarchy. The validation script checks a clean staged
+copy with Omarchy's authoritative validator, so ignored development files cannot
+leak into local installs or releases. Hardware-affecting tests should use a test
 household and must document the speaker model, firmware, and topology tested.
 
 ## Updating dependencies
@@ -33,7 +37,7 @@ household and must document the speaker model, firmware, and topology tested.
 Edit `requirements.in`, then regenerate the lock on Python 3.14:
 
 ```bash
-.venv/bin/pip-compile \
+"$DEV_VENV/bin/pip-compile" \
   --generate-hashes \
   --resolver=backtracking \
   --strip-extras \

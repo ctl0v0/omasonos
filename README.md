@@ -110,6 +110,9 @@ configuration or delete Sonos Favorites.
 - Left click opens or closes the controller card.
 - Middle click toggles play/pause.
 - The mouse wheel changes group volume in 5% steps.
+- Arrow keys or `j`/`k` move between actions; `h`/`l` adjust group volume.
+- `Space` activates the focused action, `n`/`p` change tracks, and `m` toggles mute.
+- `g` toggles playback sessions, `r` toggles group settings, and `Escape` closes.
 - `Playing on` moves a standalone session to another standalone room.
 - `Control different audio` changes which independent Sonos session is targeted.
 - `Favorites` starts a compatible saved Sonos Favorite.
@@ -138,8 +141,9 @@ Install or update a checkout on an Omarchy machine:
 ./scripts/test-local.sh
 ```
 
-The test wrapper validates the manifest, checks Omarchy registration, runs unit
-tests when `pytest` is available, and performs a backend discovery smoke test.
+The test wrapper validates a clean staged plugin with Omarchy's authoritative
+validator, lints QML when `qmllint` is available, checks Omarchy registration,
+runs unit tests when `pytest` is available, and performs a backend discovery smoke test.
 The smoke test can create the runtime virtual environment, discover and probe
 speakers, open the SoCo callback listener, and update cached discovery state. It
 does not issue playback, volume, or grouping commands.
@@ -156,8 +160,6 @@ validation commands, and dependency update process.
 ## Known limitations
 
 - The first launch requires access to the configured Python package index.
-- Full keyboard navigation and scrolling for very large households remain to be
-  completed.
 - Discovery is optimized for one household; additional Sonos households may be
   found through cached hosts or the attached-network fallback but are not yet a
   guaranteed discovery path.

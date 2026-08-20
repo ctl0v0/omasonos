@@ -32,11 +32,17 @@ Item {
       stale: false
     }
   })
-  property string lastError: ""
+  property string commandError: ""
+  property string processError: ""
+  readonly property string lastError: commandError || processError
   property int requestCounter: 0
   property int restartAttempt: 0
   property bool expectedStop: false
   property bool backendReady: false
+  property bool receivedSnapshotThisRun: false
+  property bool setupFailed: false
+  property string backendStderr: ""
+  property int openPanelCount: 0
   property string favoriteRequestId: ""
   property string favoriteStartingTitle: ""
   property bool favoriteAwaitingSnapshot: false
@@ -49,6 +55,18 @@ Item {
   readonly property var target: snapshot ? snapshot.target : null
   readonly property var households: snapshot && snapshot.households ? snapshot.households : []
 
+  function setStatus(state, message) {
+    var next = {}
+    for (var key in snapshot) next[key] = snapshot[key]
+    var status = {}
+    var currentStatus = snapshot && snapshot.status ? snapshot.status : ({})
+    for (var statusKey in currentStatus) status[statusKey] = currentStatus[statusKey]
+    status.state = state
+    status.message = message
+    next.status = status
+    snapshot = next
+  }
+
   function localPath(url) {
     var text = String(url || "")
     if (text.indexOf("file://") === 0) text = text.substring(7)
@@ -59,11 +77,12 @@ Item {
 
   function sendCommand(op, args) {
     if (!backend.running) {
-      lastError = "OmaSonos backend is not running"
+      commandError = "OmaSonos backend is not running"
       return ""
     }
     requestCounter += 1
     var id = String(requestCounter)
+    if (op !== "setPanelOpen") commandError = ""
     var payload = { id: id, op: op }
     var fields = args || ({})
     for (var key in fields) payload[key] = fields[key]
@@ -71,8 +90,25 @@ Item {
     return id
   }
 
-  function refresh() { sendCommand("refresh") }
-  function setPanelOpen(open) { sendCommand("setPanelOpen", { open: !!open }) }
+  function refresh() {
+    if (setupFailed) {
+      setupFailed = false
+      processError = ""
+      backendStderr = ""
+      restartAttempt = 0
+      setStatus("starting", "Starting OmaSonos…")
+      if (!backend.running) backend.running = true
+      return
+    }
+    sendCommand("refresh")
+  }
+  function setPanelOpen(open) {
+    var wasOpen = openPanelCount > 0
+    openPanelCount = Math.max(0, openPanelCount + (open ? 1 : -1))
+    var isOpen = openPanelCount > 0
+    if (wasOpen !== isOpen && backend.running)
+      sendCommand("setPanelOpen", { open: isOpen })
+  }
   function playPause() { sendCommand("playPause") }
   function next() { sendCommand("next") }
   function previous() { sendCommand("previous") }
@@ -106,25 +142,30 @@ Item {
     try {
       message = JSON.parse(text)
     } catch (e) {
-      lastError = "Backend emitted invalid JSON"
+      commandError = "Backend emitted invalid JSON"
       console.warn("OmaSonos invalid stdout:", text)
       return
     }
     if (message.type === "snapshot") {
+      var firstSnapshot = !receivedSnapshotThisRun
       snapshot = message
       backendReady = true
+      receivedSnapshotThisRun = true
+      setupFailed = false
       restartAttempt = 0
-      lastError = ""
+      processError = ""
       if (favoriteAwaitingSnapshot) {
         favoriteAwaitingSnapshot = false
         favoriteStartingTitle = ""
       }
+      if (firstSnapshot && openPanelCount > 0)
+        sendCommand("setPanelOpen", { open: true })
       return
     }
     if (message.type === "result" && message.ok === false) {
-      lastError = String(message.error || "Sonos command failed")
+      commandError = String(message.error || "Sonos command failed")
       if (String(message.id || "") === moveRequestId) {
-        moveError = lastError
+        moveError = commandError
         moveRequestId = ""
       }
       if (String(message.id || "") === favoriteRequestId) {
@@ -135,7 +176,6 @@ Item {
         favoriteStartingTitle = ""
       }
     } else if (message.type === "result" && message.ok === true) {
-      lastError = ""
       if (String(message.id || "") === moveRequestId) {
         moveError = ""
         moveRequestId = ""
@@ -159,18 +199,26 @@ Item {
     stderr: SplitParser {
       onRead: function(line) {
         var text = String(line || "").trim()
-        if (text) console.warn("OmaSonos:", text)
+        if (!text) return
+        var marker = "OMASONOS_SETUP_ERROR:"
+        if (text.indexOf(marker) === 0)
+          root.backendStderr = text.substring(marker.length).trim()
+        console.warn("OmaSonos:", text)
       }
     }
 
     onStarted: {
       root.backendReady = false
+      root.receivedSnapshotThisRun = false
+      root.backendStderr = ""
     }
 
     onExited: function(exitCode) {
       if (root.expectedStop) return
       root.backendReady = false
-      root.lastError = "OmaSonos backend stopped (" + exitCode + ")"
+      root.processError = root.backendStderr !== ""
+        ? root.backendStderr
+        : "OmaSonos backend stopped (" + exitCode + ")"
       if (root.favoriteRequestId !== "" || root.favoriteAwaitingSnapshot) {
         root.favoriteError = "Could not start " + root.favoriteStartingTitle
           + ": the OmaSonos backend stopped"
@@ -182,6 +230,12 @@ Item {
         root.moveError = "Could not move playback: the OmaSonos backend stopped"
       }
       root.moveRequestId = ""
+      if (!root.receivedSnapshotThisRun && root.backendStderr !== "") {
+        root.setupFailed = true
+        root.setStatus("setup_error", root.processError)
+        return
+      }
+      root.setStatus("starting", "OmaSonos stopped and will restart automatically…")
       root.restartAttempt = Math.min(root.restartAttempt + 1, 6)
       restartTimer.interval = Math.min(30000, 1000 * Math.pow(2, root.restartAttempt - 1))
       restartTimer.restart()

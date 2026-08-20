@@ -94,15 +94,9 @@ class ProtocolServer:
     def handle(self, request: dict[str, Any], output: TextIO) -> None:
         request_id = str(request.get("id", "") or "")
         op = str(request.get("op", "") or "")
-        # PLAN.md defines operation parameters at the top level. Accept a
-        # nested `args` object too for forward/backward compatibility, with
-        # explicit top-level fields winning when both are supplied.
-        nested_args = request.get("args") or {}
-        if not isinstance(nested_args, dict):
-            nested_args = {}
-        args = dict(nested_args)
+        args: dict[str, Any] = {}
         for key, value in request.items():
-            if key not in {"id", "op", "args"}:
+            if key not in {"id", "op"}:
                 args[key] = value
 
         if op == "setPanelOpen":

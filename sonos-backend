@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 PLUGIN_ID="io.github.ctl0v0.omasonos"
@@ -9,6 +9,16 @@ VENV_DIR="${DATA_DIR}/venv"
 LOCK_FILE="${DATA_DIR}/setup.lock"
 REQ_HASH_FILE="${VENV_DIR}/.requirements.sha256"
 PYTHON_BIN="${OMASONOS_PYTHON:-python3}"
+
+setup_error() {
+  printf 'OMASONOS_SETUP_ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+  || setup_error "Python 3.14 or newer is required."
+"$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 14))' \
+  || setup_error "Python 3.14 or newer is required."
 
 mkdir -p "$DATA_DIR"
 exec 9>"$LOCK_FILE"
@@ -24,11 +34,15 @@ if [[ ! -x "$VENV_DIR/bin/python" || "$installed_hash" != "$requirements_hash" ]
   tmp_venv="${VENV_DIR}.tmp.$$"
   rm -rf "$tmp_venv"
   trap 'rm -rf "$tmp_venv"' EXIT
-  "$PYTHON_BIN" -m venv "$tmp_venv"
-  "$tmp_venv/bin/python" -m pip install \
+  if ! "$PYTHON_BIN" -m venv "$tmp_venv"; then
+    setup_error "Could not create the OmaSonos Python environment."
+  fi
+  if ! "$tmp_venv/bin/python" -m pip install \
     --disable-pip-version-check \
     --require-hashes \
-    -r "$PLUGIN_DIR/requirements.lock" >&2
+    -r "$PLUGIN_DIR/requirements.lock" >&2; then
+    setup_error "Could not install OmaSonos's hash-locked Python dependencies. Check the network connection and try again."
+  fi
   printf '%s\n' "$requirements_hash" > "$tmp_venv/.requirements.sha256"
   rm -rf "$VENV_DIR"
   mv "$tmp_venv" "$VENV_DIR"

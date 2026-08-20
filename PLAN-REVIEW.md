@@ -1,5 +1,8 @@
 # Build plan review
 
+> Historical implementation review. The README, manifest, and current source
+> are authoritative for release behavior.
+
 This repository starts from the uploaded `PLAN.md` and keeps its central
 architecture: a combined Omarchy `service` + `bar-widget` plugin, one Python
 backend process, a JSON-lines protocol, and SoCo/local UPnP rather than the

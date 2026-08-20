@@ -4,9 +4,11 @@ import logging
 import hashlib
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from .model import (
     choose_target_group,
@@ -24,8 +26,13 @@ NETWORK_SCAN_RETRY_SEC = 60
 NETWORK_SCAN_TIMEOUT_SEC = 0.6
 NETWORK_SCAN_MIN_NETMASK = 24
 NETWORK_SCAN_MAX_THREADS = 128
-TOPOLOGY_SETTLE_ATTEMPTS = 20
+# Coordinator removal is substantially slower than joining on current Sonos
+# S2 firmware (observed at roughly 10-12 seconds on the target household).
+TOPOLOGY_SETTLE_ATTEMPTS = 75
 TOPOLOGY_SETTLE_INTERVAL_SEC = 0.2
+TOPOLOGY_QUERY_TIMEOUT_SEC = 2.0
+PLAYBACK_QUERY_ATTEMPTS = 2
+PLAYBACK_QUERY_RETRY_SEC = 0.08
 
 
 class ControllerError(RuntimeError):
@@ -54,7 +61,7 @@ class SonosController:
         self._backend_error = ""
         self._last_network_scan_monotonic = -NETWORK_SCAN_RETRY_SEC
         self._discovery_diagnostics: dict[str, Any] = {}
-        self._favorite_objects: dict[str, tuple[str, str]] = {}
+        self._favorite_objects: dict[str, dict[str, Any]] = {}
         self._favorites_model: dict[str, Any] = {
             "state": "not_loaded",
             "items": [],
@@ -63,6 +70,9 @@ class SonosController:
             "error": "",
         }
         self._favorites_loaded = False
+        self._favorites_household_id = ""
+        self._transport_state_cache: dict[str, str] = {}
+        self._playback_cache: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _empty_snapshot(status: str = "offline", message: str = "") -> dict[str, Any]:
@@ -95,6 +105,8 @@ class SonosController:
                 "positionSec": None,
                 "durationSec": None,
                 "availableActions": [],
+                "metadataState": "empty",
+                "stale": False,
             },
         }
 
@@ -124,6 +136,28 @@ class SonosController:
         except Exception as exc:  # noqa: BLE001 - network devices fail in many ways
             LOG.debug("Sonos query failed: %s", exc)
             return default
+
+    @staticmethod
+    def _query_with_retry(
+        label: str,
+        call: Callable[[], Any],
+        default: Any,
+    ) -> tuple[bool, Any]:
+        """Distinguish a real empty Sonos response from a network failure."""
+        for attempt in range(PLAYBACK_QUERY_ATTEMPTS):
+            try:
+                return True, call()
+            except Exception as exc:  # noqa: BLE001 - LAN devices fail transiently
+                LOG.debug(
+                    "Sonos %s query failed (%s/%s): %s",
+                    label,
+                    attempt + 1,
+                    PLAYBACK_QUERY_ATTEMPTS,
+                    exc,
+                )
+                if attempt + 1 < PLAYBACK_QUERY_ATTEMPTS:
+                    time.sleep(PLAYBACK_QUERY_RETRY_SEC)
+        return False, default
 
     @staticmethod
     def _zone_uid(zone: Any) -> str:
@@ -316,10 +350,16 @@ class SonosController:
         if not self._zones:
             return {}
         services: dict[str, Any] = {}
-        representative = next(iter(self._zones.values()))
-        topology = getattr(representative, "zoneGroupTopology", None)
-        if topology is not None:
-            services["topology"] = topology
+        household_representatives: dict[str, Any] = {}
+        for zone in self._zones.values():
+            household_id = str(
+                self._safe(lambda z=zone: z.household_id, "unknown") or "unknown"
+            )
+            household_representatives.setdefault(household_id, zone)
+        for household_id, representative in household_representatives.items():
+            topology = getattr(representative, "zoneGroupTopology", None)
+            if topology is not None:
+                services[f"topology:{household_id}"] = topology
         if self._target_group is not None:
             coordinator = self._target_group.coordinator
             group_rendering = getattr(coordinator, "groupRenderingControl", None)
@@ -438,7 +478,10 @@ class SonosController:
             self._target_group = target_group_obj
             self._target_household_id = household_id
             coordinator = target_group_obj.coordinator
-            playback = self._playback_model(coordinator)
+            playback = self._playback_model(
+                coordinator,
+                state_hint=target_model["playbackState"],
+            )
             target = {
                 "householdId": household_id,
                 "groupUid": target_uid,
@@ -455,6 +498,8 @@ class SonosController:
                 self.state.selected_room_uid = member_uids[0]
                 self._save_state_quietly()
 
+            if self._favorites_household_id != household_id:
+                self._favorites_loaded = False
             if not self._favorites_loaded:
                 self.refresh_favorites()
 
@@ -466,6 +511,7 @@ class SonosController:
                 "message": "",
                 "lastRefreshEpochMs": int(time.time() * 1000),
                 "discovery": dict(self._discovery_diagnostics),
+                "playbackDegraded": bool(playback.get("stale", False)),
             },
             "selectedAnchorRoomUid": self.state.selected_room_uid,
             "targetGroupUid": target["groupUid"] if target else "",
@@ -485,6 +531,141 @@ class SonosController:
             "hls-radio:",
         )
         return "radio" if uri.lower().startswith(radio_prefixes) else "audio"
+
+    @staticmethod
+    def _favorite_reference(favorite: Any) -> Any | None:
+        try:
+            return favorite.reference
+        except Exception as exc:  # noqa: BLE001 - malformed favorites are common
+            LOG.debug("Could not parse Sonos Favorite reference: %s", exc)
+            return None
+
+    @staticmethod
+    def _tunein_podcast_id(reference: Any) -> str:
+        """Return the TuneIn container id embedded in a Sonos Favorite.
+
+        TuneIn (New) favorites use an AppLink account that SoCo cannot read
+        back from the speaker. Podcast ids remain browseable through TuneIn's
+        anonymous legacy Sonos service, however, so no developer or user token
+        is required.
+        """
+        desc = str(getattr(reference, "desc", "") or "")
+        item_id = str(getattr(reference, "item_id", "") or "")
+        if "85255" not in desc or not item_id.startswith("100b2064"):
+            return ""
+        return unquote(item_id.removeprefix("100b2064"))
+
+    @staticmethod
+    def _tunein_service(coordinator: Any) -> Any:
+        from soco.music_services import MusicService
+
+        return MusicService("TuneIn", device=coordinator)
+
+    @staticmethod
+    def _tunein_media_url(service: Any, episode: Any) -> str:
+        """Resolve TuneIn's short M3U response to a direct episode URL."""
+        import requests
+
+        media_uri = str(service.get_media_uri(episode.id) or "")
+        if urlsplit(media_uri).scheme not in {"http", "https"}:
+            raise ControllerError("TuneIn returned an invalid podcast media URL")
+
+        with requests.get(media_uri, timeout=10, stream=True) as response:
+            response.raise_for_status()
+            content_type = str(response.headers.get("content-type", "")).lower()
+            if "mpegurl" not in content_type and not media_uri.lower().endswith(
+                (".m3u", ".m3u8")
+            ):
+                return media_uri
+
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=4096):
+                size += len(chunk)
+                if size > 256 * 1024:
+                    raise ControllerError("TuneIn returned an oversized podcast playlist")
+                chunks.append(chunk)
+
+        playlist = b"".join(chunks).decode("utf-8", errors="replace")
+        for line in playlist.splitlines():
+            candidate = line.strip()
+            if not candidate or candidate.startswith("#"):
+                continue
+            if urlsplit(candidate).scheme in {"http", "https"}:
+                return candidate
+        raise ControllerError("TuneIn returned an empty podcast playlist")
+
+    @staticmethod
+    def _podcast_playback_metadata(episode: Any, media_url: str) -> str:
+        """Build rich DIDL metadata for a resolved TuneIn podcast episode."""
+        episode_metadata = getattr(episode, "metadata", {})
+        if not isinstance(episode_metadata, dict):
+            episode_metadata = {}
+        track_metadata = getattr(episode_metadata.get("track_metadata"), "metadata", {})
+        if not isinstance(track_metadata, dict):
+            track_metadata = {}
+
+        title = str(getattr(episode, "title", "") or "Podcast")
+        show = str(
+            track_metadata.get("podcast")
+            or track_metadata.get("associated_show")
+            or ""
+        )
+        artist = str(
+            track_metadata.get("host")
+            or track_metadata.get("artist")
+            or track_metadata.get("producer")
+            or ""
+        )
+        artwork = str(track_metadata.get("album_art_uri") or "")
+        if urlsplit(artwork).scheme not in {"http", "https"}:
+            artwork = ""
+
+        didl_ns = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+        dc_ns = "http://purl.org/dc/elements/1.1/"
+        upnp_ns = "urn:schemas-upnp-org:metadata-1-0/upnp/"
+        rincon_ns = "urn:schemas-rinconnetworks-com:metadata-1-0/"
+        ET.register_namespace("", didl_ns)
+        ET.register_namespace("dc", dc_ns)
+        ET.register_namespace("upnp", upnp_ns)
+        ET.register_namespace("r", rincon_ns)
+        root = ET.Element(f"{{{didl_ns}}}DIDL-Lite")
+        item = ET.SubElement(
+            root,
+            f"{{{didl_ns}}}item",
+            {"id": "R:0/0/0", "parentID": "R:0/0", "restricted": "true"},
+        )
+        ET.SubElement(item, f"{{{dc_ns}}}title").text = title
+        ET.SubElement(item, f"{{{upnp_ns}}}class").text = (
+            "object.item.audioItem.musicTrack"
+        )
+        if artist:
+            ET.SubElement(item, f"{{{dc_ns}}}creator").text = artist
+            ET.SubElement(item, f"{{{upnp_ns}}}artist").text = artist
+        if show:
+            ET.SubElement(item, f"{{{upnp_ns}}}album").text = show
+        if artwork:
+            ET.SubElement(item, f"{{{upnp_ns}}}albumArtURI").text = artwork
+        description = str(getattr(episode, "desc", "") or "SA_RINCON65031_")
+        desc = ET.SubElement(
+            item,
+            f"{{{didl_ns}}}desc",
+            {"id": "cdudn", "nameSpace": rincon_ns},
+        )
+        desc.text = description
+        resource = ET.SubElement(
+            item,
+            f"{{{didl_ns}}}res",
+            {"protocolInfo": "http-get:*:audio/mpeg:*"},
+        )
+        duration = track_metadata.get("duration")
+        try:
+            if duration is not None:
+                resource.set("duration", format_sonos_time(int(duration)))
+        except (TypeError, ValueError):
+            pass
+        resource.text = media_url
+        return ET.tostring(root, encoding="unicode")
 
     @staticmethod
     def _favorite_is_directly_playable(uri: str) -> bool:
@@ -509,6 +690,7 @@ class SonosController:
 
     def refresh_favorites(self) -> None:
         self._favorites_loaded = True
+        self._favorites_household_id = self._target_household_id
         self._favorite_objects = {}
         if self._target_group is None:
             self._favorites_model = {
@@ -533,17 +715,38 @@ class SonosController:
                 uri = str(getattr(resources[0], "uri", "") or "") if resources else ""
                 metadata = str(getattr(favorite, "resource_meta_data", "") or "")
                 title = self._clean_name(getattr(favorite, "title", ""), "Favorite")
-                if not uri or not metadata or not self._favorite_is_directly_playable(uri):
+                reference = self._favorite_reference(favorite) if metadata else None
+                playback: dict[str, Any] | None = None
+                kind = self._favorite_kind(uri)
+                identity = uri
+                if uri and metadata and self._favorite_is_directly_playable(uri):
+                    playback = {
+                        "mode": "direct",
+                        "uri": uri,
+                        "metadata": metadata,
+                    }
+                elif uri.lower().startswith("x-rincon-cpcontainer:") and reference:
+                    playback = {"mode": "queue", "item": reference}
+                elif reference:
+                    podcast_id = self._tunein_podcast_id(reference)
+                    if podcast_id:
+                        playback = {
+                            "mode": "tuneinPodcast",
+                            "podcastId": podcast_id,
+                        }
+                        identity = podcast_id
+                        kind = "podcast"
+                if playback is None:
                     continue
                 favorite_id = hashlib.sha256(
-                    f"{title}\0{uri}\0{metadata}".encode("utf-8")
+                    f"{title}\0{identity}\0{metadata}".encode("utf-8")
                 ).hexdigest()[:20]
-                self._favorite_objects[favorite_id] = (uri, metadata)
+                self._favorite_objects[favorite_id] = playback
                 items.append(
                     {
                         "id": favorite_id,
                         "title": title,
-                        "kind": self._favorite_kind(uri),
+                        "kind": kind,
                     }
                 )
             self._favorites_model = {
@@ -567,8 +770,46 @@ class SonosController:
         favorite = self._favorite_objects.get(favorite_id)
         if favorite is None:
             raise ControllerError("Unknown or unavailable Sonos Favorite")
-        uri, metadata = favorite
-        self._coordinator().play_uri(uri=uri, meta=metadata, start=True)
+        coordinator = self._coordinator()
+        mode = favorite["mode"]
+        if mode == "direct":
+            coordinator.play_uri(
+                uri=favorite["uri"],
+                meta=favorite["metadata"],
+                start=True,
+            )
+            return
+        if mode == "queue":
+            queue_position = coordinator.add_to_queue(favorite["item"])
+            coordinator.play_from_queue(queue_position - 1)
+            return
+        if mode == "tuneinPodcast":
+            try:
+                service = self._tunein_service(coordinator)
+                episodes = service.get_metadata(
+                    favorite["podcastId"],
+                    count=1,
+                )
+                episode = next(iter(episodes))
+                media_url = self._tunein_media_url(service, episode)
+                metadata = self._podcast_playback_metadata(episode, media_url)
+                coordinator.play_uri(
+                    uri=media_url,
+                    meta=metadata,
+                    start=True,
+                )
+                return
+            except (StopIteration, TypeError) as exc:
+                raise ControllerError(
+                    "TuneIn did not return a playable podcast episode"
+                ) from exc
+            except ControllerError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - normalize service failures
+                raise ControllerError(
+                    f"Could not load the TuneIn podcast: {type(exc).__name__}: {exc}"
+                ) from exc
+        raise ControllerError("Unsupported Sonos Favorite playback mode")
 
     def _room_model(self, zone: Any) -> dict[str, Any]:
         return {
@@ -580,6 +821,21 @@ class SonosController:
             "mute": bool(self._safe(lambda z=zone: z.mute, False)),
         }
 
+    def _transport_state(self, coordinator: Any) -> tuple[str, bool]:
+        uid = self._zone_uid(coordinator)
+        ok, transport = self._query_with_retry(
+            f"transport for {uid or 'unknown coordinator'}",
+            lambda: coordinator.get_current_transport_info(),
+            {},
+        )
+        if ok and isinstance(transport, dict):
+            state = str(transport.get("current_transport_state", "") or "").upper()
+            if state:
+                self._transport_state_cache[uid] = state
+                return state, True
+        cached = self._transport_state_cache.get(uid, "UNKNOWN")
+        return cached, False
+
     def _group_model(self, group: Any) -> dict[str, Any]:
         coordinator = group.coordinator
         members = sorted(
@@ -588,8 +844,7 @@ class SonosController:
         )
         member_uids = [self._zone_uid(member) for member in members]
         names = [self._zone_name(member) for member in members]
-        transport = self._safe(lambda c=coordinator: c.get_current_transport_info(), {}) or {}
-        state = str(transport.get("current_transport_state", "STOPPED") or "STOPPED")
+        state, _ = self._transport_state(coordinator)
         group_uid = self._zone_uid(coordinator)
         return {
             "uid": group_uid,
@@ -601,27 +856,143 @@ class SonosController:
             "playbackState": state,
         }
 
-    def _playback_model(self, coordinator: Any) -> dict[str, Any]:
-        track = self._safe(lambda: coordinator.get_current_track_info(), {}) or {}
-        transport = self._safe(lambda: coordinator.get_current_transport_info(), {}) or {}
+    @staticmethod
+    def _media_metadata(response: Any) -> dict[str, str]:
+        """Extract station/container metadata omitted by track-position info."""
+        if not isinstance(response, dict):
+            return {"title": "", "artworkUrl": "", "uri": ""}
+        result = {
+            "title": "",
+            "artworkUrl": "",
+            "uri": str(response.get("CurrentURI", "") or ""),
+        }
+        raw = str(response.get("CurrentURIMetaData", "") or "")
+        if not raw or raw == "NOT_IMPLEMENTED":
+            return result
+        try:
+            metadata = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            LOG.debug("Could not parse Sonos media metadata: %s", exc)
+            return result
+        result["title"] = str(
+            metadata.findtext(".//{http://purl.org/dc/elements/1.1/}title") or ""
+        )
+        result["artworkUrl"] = str(
+            metadata.findtext(
+                ".//{urn:schemas-upnp-org:metadata-1-0/upnp/}albumArtURI"
+            )
+            or ""
+        )
+        return result
+
+    def _playback_model(
+        self,
+        coordinator: Any,
+        *,
+        state_hint: str = "UNKNOWN",
+    ) -> dict[str, Any]:
+        uid = self._zone_uid(coordinator)
+        cached = self._playback_cache.get(uid, {})
+        track_ok, track = self._query_with_retry(
+            f"track metadata for {uid or 'unknown coordinator'}",
+            lambda: coordinator.get_current_track_info(),
+            {},
+        )
+        if not isinstance(track, dict):
+            track_ok = False
+            track = {}
+
+        state, transport_ok = self._transport_state(coordinator)
+        if state == "UNKNOWN" and state_hint:
+            state = str(state_hint).upper()
+
+        media_ok, media_response = self._query_with_retry(
+            f"media metadata for {uid or 'unknown coordinator'}",
+            lambda: coordinator.avTransport.GetMediaInfo([("InstanceID", 0)]),
+            {},
+        )
+        media = self._media_metadata(media_response) if media_ok else {
+            "title": "",
+            "artworkUrl": "",
+            "uri": "",
+        }
+
         actions = self._safe(lambda: coordinator.available_actions, []) or []
-        source = self._safe(lambda: coordinator.music_source, "UNKNOWN") or "UNKNOWN"
-        artwork = str(track.get("album_art", "") or "")
+        source = str(
+            self._safe(lambda: coordinator.music_source, cached.get("source", "UNKNOWN"))
+            or cached.get("source", "UNKNOWN")
+            or "UNKNOWN"
+        )
+        artwork = str(track.get("album_art", "") or media["artworkUrl"] or "")
         if artwork.startswith("/"):
             artwork = f"http://{coordinator.ip_address}:1400{artwork}"
-        return {
-            "state": str(
-                transport.get("current_transport_state", "STOPPED") or "STOPPED"
-            ),
-            "title": str(track.get("title", "") or ""),
+
+        track_title = str(track.get("title", "") or "")
+        media_title = str(media["title"] or "")
+        # Direct podcast streams can expose a shortened title through
+        # GetPositionInfo while retaining the complete title in media metadata.
+        title = track_title or media_title
+        if media_title and track_title and media_title.startswith(track_title):
+            title = media_title
+
+        model: dict[str, Any] = {
+            "state": state,
+            "title": title,
             "artist": str(track.get("artist", "") or ""),
             "album": str(track.get("album", "") or ""),
             "artworkUrl": artwork,
-            "source": str(source),
+            "source": source,
             "positionSec": parse_sonos_time(track.get("position")),
             "durationSec": parse_sonos_time(track.get("duration")),
             "availableActions": sorted({str(action) for action in actions}),
+            "metadataState": "fresh",
+            "stale": not transport_ok or not track_ok,
         }
+
+        active = state in {"PLAYING", "PAUSED_PLAYBACK", "TRANSITIONING"}
+        used_cached_metadata = False
+        if active and cached and (not track_ok or not media_ok):
+            for key in ("title", "artist", "album", "artworkUrl"):
+                if not model[key] and cached.get(key):
+                    model[key] = cached[key]
+                    used_cached_metadata = True
+            if model["positionSec"] is None and not track_ok:
+                model["positionSec"] = cached.get("positionSec")
+            if model["durationSec"] is None and not track_ok:
+                model["durationSec"] = cached.get("durationSec")
+            if not model["availableActions"]:
+                model["availableActions"] = list(cached.get("availableActions", []))
+
+        if active:
+            if used_cached_metadata:
+                model["metadataState"] = "cached"
+            elif not model["title"] and not model["artist"] and not model["artworkUrl"]:
+                model["metadataState"] = "unavailable"
+            self._playback_cache[uid] = dict(model)
+        elif state == "STOPPED" and transport_ok:
+            # A confirmed stop must not display a previous session's track.
+            self._playback_cache.pop(uid, None)
+            model.update(
+                {
+                    "title": "",
+                    "artist": "",
+                    "album": "",
+                    "artworkUrl": "",
+                    "positionSec": None,
+                    "durationSec": None,
+                    "metadataState": "empty",
+                    "stale": False,
+                }
+            )
+        elif cached:
+            # If transport itself is unreachable, retain the last confirmed
+            # session instead of manufacturing a STOPPED/blank snapshot.
+            preserved = dict(cached)
+            preserved["stale"] = True
+            preserved["metadataState"] = "cached"
+            return preserved
+
+        return model
 
     def _coordinator(self) -> Any:
         if self._target_group is None:
@@ -646,6 +1017,53 @@ class SonosController:
             if callable(clear_cache):
                 self._safe(clear_cache)
 
+    def _household_representative(self, household_id: str = "") -> Any | None:
+        for zone in self._zones.values():
+            if not household_id:
+                return zone
+            zone_household = str(
+                self._safe(lambda z=zone: z.household_id, "unknown") or "unknown"
+            )
+            if zone_household == household_id:
+                return zone
+        return None
+
+    def _refresh_topology_authoritatively(self, household_id: str = "") -> bool:
+        """Bypass SoCo's subscription-backed topology cache.
+
+        SoCo 0.31.2 declines to poll ZoneGroupState while any subscription is
+        active. The threaded events implementation does not apply the topology
+        payload to ZoneGroupState, so group mutations otherwise remain stale.
+        """
+        representative = self._household_representative(household_id)
+        if representative is None:
+            return False
+        service = getattr(representative, "zoneGroupTopology", None)
+        topology = getattr(representative, "zone_group_state", None)
+        get_state = getattr(service, "GetZoneGroupState", None)
+        process_payload = getattr(topology, "process_payload", None)
+        if not callable(get_state) or not callable(process_payload):
+            return False
+        try:
+            response = get_state(timeout=TOPOLOGY_QUERY_TIMEOUT_SEC)
+            payload = response.get("ZoneGroupState", "") if response else ""
+            if not payload:
+                return False
+            process_payload(
+                payload=payload,
+                source="omasonos-authoritative-poll",
+                source_ip=str(getattr(representative, "ip_address", "") or ""),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - retry/fallback owns failures
+            LOG.debug("Authoritative Sonos topology query failed: %s", exc)
+            return False
+
+    def refresh_event_topologies(self, household_ids: Iterable[str]) -> None:
+        """Apply authoritative topology after SoCo's threaded event callback."""
+        for household_id in sorted(set(household_ids)):
+            self._refresh_topology_authoritatively(household_id)
+
     @staticmethod
     def _snapshot_group_for_room(
         snapshot: dict[str, Any], household_id: str, room_uid: str
@@ -659,21 +1077,122 @@ class SonosController:
         return None
 
     def _wait_for_topology(
-        self, predicate: Callable[[dict[str, Any]], bool]
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        household_id: str = "",
+        phase: str = "topology mutation",
     ) -> dict[str, Any]:
         """Poll briefly while Sonos and SoCo converge after a group mutation."""
         latest: dict[str, Any] = {}
+        started = time.monotonic()
         for attempt in range(TOPOLOGY_SETTLE_ATTEMPTS):
             # SoCo's join/unjoin methods clear only the mutated speaker's
             # cache. Refresh may use another household member as its topology
             # representative, so invalidate all known views before checking.
             self._clear_topology_caches()
+            authoritative = self._refresh_topology_authoritatively(household_id)
             latest = self.refresh(rediscover=False)
             if predicate(latest):
+                LOG.info(
+                    "Sonos %s confirmed after %.2fs (%s checks, authoritative=%s)",
+                    phase,
+                    time.monotonic() - started,
+                    attempt + 1,
+                    authoritative,
+                )
                 return latest
             if attempt + 1 < TOPOLOGY_SETTLE_ATTEMPTS:
                 time.sleep(TOPOLOGY_SETTLE_INTERVAL_SEC)
+        LOG.warning(
+            "Sonos %s did not converge after %.2fs (%s checks)",
+            phase,
+            time.monotonic() - started,
+            TOPOLOGY_SETTLE_ATTEMPTS,
+        )
         return latest
+
+    def _wait_for_room_memberships(
+        self,
+        household_id: str,
+        expected: dict[str, set[str]],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Wait on the small topology model, avoiding full household refreshes."""
+        representative = self._household_representative(household_id)
+        topology = getattr(representative, "zone_group_state", None)
+        if topology is None or not callable(
+            getattr(topology, "process_payload", None)
+        ):
+            return self._wait_for_topology(
+                lambda current: all(
+                    set(
+                        (
+                            self._snapshot_group_for_room(
+                                current, household_id, room_uid
+                            )
+                            or {}
+                        ).get("memberUids", [])
+                    )
+                    == members
+                    for room_uid, members in expected.items()
+                ),
+                household_id=household_id,
+                phase=phase,
+            )
+
+        started = time.monotonic()
+        logical_uids = set(self._zones)
+        observed: dict[str, set[str]] = {}
+        for attempt in range(TOPOLOGY_SETTLE_ATTEMPTS):
+            self._refresh_topology_authoritatively(household_id)
+            observed = {}
+            for group in getattr(topology, "groups", set()) or set():
+                members = {
+                    self._zone_uid(member)
+                    for member in getattr(group, "members", set())
+                    if self._zone_uid(member) in logical_uids
+                }
+                for uid in members:
+                    observed[uid] = members
+            if all(observed.get(uid, set()) == members for uid, members in expected.items()):
+                LOG.info(
+                    "Sonos %s confirmed after %.2fs (%s topology checks)",
+                    phase,
+                    time.monotonic() - started,
+                    attempt + 1,
+                )
+                return self.refresh(rediscover=False)
+            if attempt + 1 < TOPOLOGY_SETTLE_ATTEMPTS:
+                time.sleep(TOPOLOGY_SETTLE_INTERVAL_SEC)
+        LOG.warning(
+            "Sonos %s did not converge after %.2fs; observed memberships: %s",
+            phase,
+            time.monotonic() - started,
+            {uid: sorted(members) for uid, members in observed.items()},
+        )
+        return self.refresh(rediscover=False)
+
+    def _refresh_after_topology_mutation(self, household_id: str) -> dict[str, Any]:
+        self._clear_topology_caches()
+        self._refresh_topology_authoritatively(household_id)
+        return self.refresh(rediscover=False)
+
+    @staticmethod
+    def _play_confirmed_coordinator(zone: Any) -> None:
+        """Play after snapshot verification without consulting SoCo's stale role cache."""
+        try:
+            zone.play()
+            return
+        except Exception as exc:  # noqa: BLE001 - normalize one SoCo cache defect
+            if type(exc).__name__ != "SoCoSlaveException":
+                raise
+            LOG.info(
+                "Bypassing stale SoCo coordinator role for confirmed room %s",
+                SonosController._zone_uid(zone),
+            )
+        zone.avTransport.Play([("InstanceID", 0), ("Speed", 1)])
 
     def select_group(self, group_uid: str) -> None:
         snapshot = self.refresh(rediscover=False)
@@ -738,6 +1257,92 @@ class SonosController:
     def set_room_mute(self, room_uid: str, mute: Any) -> None:
         self._zone(room_uid).mute = bool(mute)
 
+    def _rollback_audio_handoff(
+        self,
+        source: Any,
+        destination: Any,
+        source_uid: str,
+        destination_uid: str,
+        household_id: str,
+        source_was_playing: bool,
+    ) -> None:
+        """Best-effort restoration of the pre-handoff standalone rooms."""
+        LOG.warning(
+            "Rolling back Sonos audio handoff %s -> %s",
+            source_uid,
+            destination_uid,
+        )
+        try:
+            destination.unjoin()
+            self._wait_for_room_memberships(
+                household_id,
+                {
+                    source_uid: {source_uid},
+                    destination_uid: {destination_uid},
+                },
+                phase="handoff rollback",
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the original error
+            LOG.warning("Could not fully restore Sonos topology: %s", exc)
+        self.state.selected_room_uid = source_uid
+        self._save_state_quietly()
+        if source_was_playing:
+            try:
+                self._play_confirmed_coordinator(source)
+            except Exception as exc:  # noqa: BLE001 - preserve the original error
+                LOG.warning("Could not resume source after handoff rollback: %s", exc)
+
+    def _move_direct_stream(
+        self,
+        source: Any,
+        destination: Any,
+        snapshot: dict[str, Any],
+    ) -> bool:
+        """Move addressable streams without slow, failure-prone regrouping."""
+        ok, media = self._query_with_retry(
+            "media for direct room handoff",
+            lambda: source.avTransport.GetMediaInfo([("InstanceID", 0)]),
+            {},
+        )
+        if not ok or not isinstance(media, dict):
+            return False
+        uri = str(media.get("CurrentURI", "") or "")
+        if not self._favorite_is_directly_playable(uri):
+            return False
+        metadata = str(media.get("CurrentURIMetaData", "") or "")
+        position = snapshot.get("playback", {}).get("positionSec")
+        actions = {
+            str(action) for action in snapshot.get("playback", {}).get("availableActions", [])
+        }
+
+        source.pause()
+        try:
+            destination.avTransport.SetAVTransportURI(
+                [
+                    ("InstanceID", 0),
+                    ("CurrentURI", uri),
+                    ("CurrentURIMetaData", metadata),
+                ]
+            )
+            if position is not None and "SeekTime" in actions:
+                destination.avTransport.Seek(
+                    [
+                        ("InstanceID", 0),
+                        ("Unit", "REL_TIME"),
+                        ("Target", format_sonos_time(max(0, int(position)))),
+                    ]
+                )
+            self._play_confirmed_coordinator(destination)
+        except Exception:
+            self._play_confirmed_coordinator(source)
+            raise
+        LOG.info(
+            "Moved direct Sonos stream %s -> %s without regrouping",
+            self._zone_uid(source),
+            self._zone_uid(destination),
+        )
+        return True
+
     def move_playback_to_room(self, room_uid: str) -> None:
         """Select a room, moving the current session only while it is playing.
 
@@ -765,9 +1370,9 @@ class SonosController:
         }:
             raise ControllerError("The selected room is unavailable")
 
-        source_was_playing = (
-            str(snapshot.get("playback", {}).get("state", "")).upper() == "PLAYING"
-        )
+        source_was_playing = str(
+            snapshot.get("playback", {}).get("state", "")
+        ).upper() in {"PLAYING", "TRANSITIONING"}
         if not source_was_playing:
             self.state.selected_room_uid = room_uid
             self._save_state_quietly()
@@ -794,6 +1399,11 @@ class SonosController:
         source = self._zone(source_uid)
         destination = self._zone(room_uid)
 
+        if self._move_direct_stream(source, destination, snapshot):
+            self.state.selected_room_uid = room_uid
+            self._save_state_quietly()
+            return
+
         # Silence the source before the session handoff so joining the
         # destination never makes both rooms audible, even briefly.
         if source_was_playing:
@@ -809,20 +1419,27 @@ class SonosController:
             raise
 
         household_id = str(target.get("householdId", ""))
-        joined = self._wait_for_topology(
-            lambda current: set(
-                (
-                    self._snapshot_group_for_room(current, household_id, source_uid)
-                    or {}
-                ).get("memberUids", [])
-            )
-            == {source_uid, room_uid}
+        joined = self._wait_for_room_memberships(
+            household_id,
+            {
+                source_uid: {source_uid, room_uid},
+                room_uid: {source_uid, room_uid},
+            },
+            phase="handoff join",
         )
         joined_group = self._snapshot_group_for_room(
             joined, household_id, source_uid
         ) or {}
         joined_members = set(joined_group.get("memberUids", []))
         if joined_members != {source_uid, room_uid}:
+            self._rollback_audio_handoff(
+                source,
+                destination,
+                source_uid,
+                room_uid,
+                household_id,
+                source_was_playing,
+            )
             raise ControllerError(
                 "Sonos did not prepare the selected room for the audio handoff"
             )
@@ -832,21 +1449,10 @@ class SonosController:
         self.state.selected_room_uid = room_uid
         self._save_state_quietly()
         source.unjoin()
-        final = self._wait_for_topology(
-            lambda current: set(
-                (
-                    self._snapshot_group_for_room(current, household_id, source_uid)
-                    or {}
-                ).get("memberUids", [])
-            )
-            == {source_uid}
-            and set(
-                (
-                    self._snapshot_group_for_room(current, household_id, room_uid)
-                    or {}
-                ).get("memberUids", [])
-            )
-            == {room_uid}
+        final = self._wait_for_room_memberships(
+            household_id,
+            {source_uid: {source_uid}, room_uid: {room_uid}},
+            phase="handoff detach",
         )
 
         source_group = self._snapshot_group_for_room(final, household_id, source_uid) or {}
@@ -858,6 +1464,14 @@ class SonosController:
         source_state = str(source_group.get("playbackState", "")).upper()
 
         if source_members != {source_uid} or destination_members != {room_uid}:
+            self._rollback_audio_handoff(
+                source,
+                destination,
+                source_uid,
+                room_uid,
+                household_id,
+                source_was_playing,
+            )
             raise ControllerError(
                 "Sonos partially moved the audio; the rooms are not standalone"
             )
@@ -868,8 +1482,7 @@ class SonosController:
         if source_was_playing:
             if source_state == "PLAYING":
                 source.pause()
-            destination.play()
-            self.refresh(rediscover=False)
+            self._play_confirmed_coordinator(destination)
 
         self.state.selected_room_uid = room_uid
         self._save_state_quietly()
@@ -919,7 +1532,7 @@ class SonosController:
             if uid in current_members:
                 continue
             self._zone(uid).join(master)
-            refreshed = self.refresh(rediscover=False)
+            refreshed = self._refresh_after_topology_mutation(target["householdId"])
             current = refreshed.get("target") or {}
             current_members = set(current.get("memberUids", []))
             if uid not in current_members:
@@ -933,7 +1546,7 @@ class SonosController:
             if uid == old_coordinator_uid or uid in requested_set:
                 continue
             self._zone(uid).unjoin()
-            self.refresh(rediscover=False)
+            self._refresh_after_topology_mutation(target["householdId"])
 
         # Coordinator removal is deliberately last because Sonos elects the
         # replacement. Anchor to a retained room before the topology shifts.
@@ -942,7 +1555,7 @@ class SonosController:
             self._save_state_quietly()
             detached = self._zone(old_coordinator_uid)
             detached.unjoin()
-            final = self.refresh(rediscover=False)
+            final = self._refresh_after_topology_mutation(target["householdId"])
 
             # Sonos may leave the old coordinator playing by itself after it
             # becomes a standalone group. Stop it only after topology confirms

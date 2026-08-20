@@ -27,13 +27,16 @@ Item {
       source: "UNKNOWN",
       positionSec: null,
       durationSec: null,
-      availableActions: []
+      availableActions: [],
+      metadataState: "empty",
+      stale: false
     }
   })
   property string lastError: ""
   property int requestCounter: 0
   property int restartAttempt: 0
   property bool expectedStop: false
+  property bool backendReady: false
   property string favoriteRequestId: ""
   property string favoriteStartingTitle: ""
   property bool favoriteAwaitingSnapshot: false
@@ -41,7 +44,7 @@ Item {
   property string moveRequestId: ""
   property string moveError: ""
 
-  readonly property bool ready: snapshot && snapshot.status && snapshot.status.state === "ready"
+  readonly property bool ready: backendReady && snapshot && snapshot.status && snapshot.status.state === "ready"
   readonly property var playback: snapshot && snapshot.playback ? snapshot.playback : ({})
   readonly property var target: snapshot ? snapshot.target : null
   readonly property var households: snapshot && snapshot.households ? snapshot.households : []
@@ -109,6 +112,9 @@ Item {
     }
     if (message.type === "snapshot") {
       snapshot = message
+      backendReady = true
+      restartAttempt = 0
+      lastError = ""
       if (favoriteAwaitingSnapshot) {
         favoriteAwaitingSnapshot = false
         favoriteStartingTitle = ""
@@ -158,13 +164,24 @@ Item {
     }
 
     onStarted: {
-      root.restartAttempt = 0
-      root.lastError = ""
+      root.backendReady = false
     }
 
     onExited: function(exitCode) {
       if (root.expectedStop) return
+      root.backendReady = false
       root.lastError = "OmaSonos backend stopped (" + exitCode + ")"
+      if (root.favoriteRequestId !== "" || root.favoriteAwaitingSnapshot) {
+        root.favoriteError = "Could not start " + root.favoriteStartingTitle
+          + ": the OmaSonos backend stopped"
+      }
+      root.favoriteRequestId = ""
+      root.favoriteAwaitingSnapshot = false
+      root.favoriteStartingTitle = ""
+      if (root.moveRequestId !== "") {
+        root.moveError = "Could not move playback: the OmaSonos backend stopped"
+      }
+      root.moveRequestId = ""
       root.restartAttempt = Math.min(root.restartAttempt + 1, 6)
       restartTimer.interval = Math.min(30000, 1000 * Math.pow(2, root.restartAttempt - 1))
       restartTimer.restart()

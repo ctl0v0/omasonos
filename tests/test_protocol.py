@@ -111,4 +111,43 @@ def test_refresh_exception_becomes_error_snapshot():
     message = decoded(output)[0]
     assert message["type"] == "snapshot"
     assert message["status"]["state"] == "error"
+    assert message["favorites"]["state"] == "not_loaded"
     assert "network exploded" in message["status"]["message"]
+
+
+def test_refresh_exception_retains_last_good_playback_snapshot():
+    class FlakyController(FakeController):
+        def __init__(self):
+            super().__init__()
+            self.fail = False
+
+        def refresh(self, *, rediscover=True):
+            if self.fail:
+                raise OSError("speaker temporarily unavailable")
+            return {
+                "type": "snapshot",
+                "version": 1,
+                "status": {"state": "ready", "message": ""},
+                "households": [],
+                "target": {"roomLabel": "Office"},
+                "playback": {
+                    "state": "PLAYING",
+                    "title": "The Last Good Track",
+                    "artworkUrl": "https://example.test/art.png",
+                },
+            }
+
+    controller = FlakyController()
+    server = ProtocolServer(controller)  # type: ignore[arg-type]
+    output = io.StringIO()
+    server.emit_snapshot(output)
+    controller.fail = True
+    server.emit_snapshot(output)
+
+    message = decoded(output)[-1]
+    assert message["status"]["state"] == "ready"
+    assert message["status"]["degraded"] is True
+    assert message["playback"]["state"] == "PLAYING"
+    assert message["playback"]["title"] == "The Last Good Track"
+    assert message["playback"]["artworkUrl"] == "https://example.test/art.png"
+    assert message["playback"]["stale"] is True

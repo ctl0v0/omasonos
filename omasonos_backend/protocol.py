@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import select
@@ -13,6 +14,10 @@ from .live_updates import EventSubscriptionManager, WakeQueue
 
 LOG = logging.getLogger(__name__)
 EVENT_BURST_SEC = 0.075
+EVENT_PANEL_POLL_SEC = 5.0
+EVENT_BACKGROUND_POLL_SEC = 15.0
+FALLBACK_PANEL_POLL_SEC = 2.0
+FALLBACK_BACKGROUND_POLL_SEC = 5.0
 
 
 class ProtocolServer:
@@ -20,6 +25,7 @@ class ProtocolServer:
         self.controller = controller
         self.panel_open = False
         self.last_refresh = 0.0
+        self.last_snapshot: dict[str, Any] | None = None
         self.event_queue = WakeQueue()
         self.event_subscriptions = EventSubscriptionManager(self.event_queue)
 
@@ -34,32 +40,54 @@ class ProtocolServer:
                 self.controller.event_services()
             )
             snapshot.setdefault("status", {})["liveUpdates"] = diagnostics
+            self.last_snapshot = copy.deepcopy(snapshot)
         except Exception as exc:  # noqa: BLE001 - keep the service alive on LAN faults
             LOG.exception("Sonos refresh failed")
-            snapshot = {
-                "type": "snapshot",
-                "version": 1,
-                "status": {
-                    "state": "error",
-                    "message": f"{type(exc).__name__}: {exc}",
-                    "lastRefreshEpochMs": int(time.time() * 1000),
-                },
-                "selectedAnchorRoomUid": "",
-                "targetGroupUid": "",
-                "households": [],
-                "target": None,
-                "playback": {
-                    "state": "STOPPED",
-                    "title": "",
-                    "artist": "",
-                    "album": "",
-                    "artworkUrl": "",
-                    "source": "UNKNOWN",
-                    "positionSec": None,
-                    "durationSec": None,
-                    "availableActions": [],
-                },
-            }
+            if self.last_snapshot is not None:
+                snapshot = copy.deepcopy(self.last_snapshot)
+                status = snapshot.setdefault("status", {})
+                status["state"] = (
+                    "ready" if status.get("state") == "ready" else "error"
+                )
+                status["message"] = f"{type(exc).__name__}: {exc}"
+                status["degraded"] = True
+                status["lastRefreshEpochMs"] = int(time.time() * 1000)
+                snapshot.setdefault("playback", {})["stale"] = True
+                snapshot["playback"]["metadataState"] = "cached"
+            else:
+                snapshot = {
+                    "type": "snapshot",
+                    "version": 1,
+                    "status": {
+                        "state": "error",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "lastRefreshEpochMs": int(time.time() * 1000),
+                    },
+                    "selectedAnchorRoomUid": "",
+                    "targetGroupUid": "",
+                    "households": [],
+                    "target": None,
+                    "favorites": {
+                        "state": "not_loaded",
+                        "items": [],
+                        "total": 0,
+                        "unsupported": 0,
+                        "error": "",
+                    },
+                    "playback": {
+                        "state": "STOPPED",
+                        "title": "",
+                        "artist": "",
+                        "album": "",
+                        "artworkUrl": "",
+                        "source": "UNKNOWN",
+                        "positionSec": None,
+                        "durationSec": None,
+                        "availableActions": [],
+                        "metadataState": "empty",
+                        "stale": False,
+                    },
+                }
         self.last_refresh = time.monotonic()
         self._emit(snapshot, output)
 
@@ -174,12 +202,19 @@ class ProtocolServer:
 
     def serve(self, input_stream: TextIO = sys.stdin, output: TextIO = sys.stdout) -> None:
         pending_event_at: float | None = None
+        pending_topology_households: set[str] = set()
         try:
             self.emit_snapshot(output)
             while True:
                 live = self.event_subscriptions.complete
-                interval = (10.0 if self.panel_open else 30.0) if live else (
-                    2.0 if self.panel_open else 10.0
+                interval = (
+                    EVENT_PANEL_POLL_SEC
+                    if self.panel_open
+                    else EVENT_BACKGROUND_POLL_SEC
+                ) if live else (
+                    FALLBACK_PANEL_POLL_SEC
+                    if self.panel_open
+                    else FALLBACK_BACKGROUND_POLL_SEC
                 )
                 now = time.monotonic()
                 poll_timeout = max(0.0, interval - (now - self.last_refresh))
@@ -190,10 +225,20 @@ class ProtocolServer:
                 )
                 now = time.monotonic()
                 if self.event_queue.read_fd in readable:
-                    self.event_queue.drain()
+                    for event in self.event_queue.drain_items():
+                        if not isinstance(event, dict):
+                            continue
+                        key = str(event.get("subscriptionKey", ""))
+                        if key.startswith("topology:"):
+                            pending_topology_households.add(key.removeprefix("topology:"))
                     pending_event_at = now + EVENT_BURST_SEC
                 if pending_event_at is not None and now >= pending_event_at:
                     pending_event_at = None
+                    if pending_topology_households:
+                        self.controller.refresh_event_topologies(
+                            pending_topology_households
+                        )
+                        pending_topology_households.clear()
                     self.emit_snapshot(output, rediscover=False)
                     continue
                 if not readable:

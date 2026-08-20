@@ -113,6 +113,17 @@ def read_json_line(proc: subprocess.Popen[str], deadline: float) -> dict:
     raise TimeoutError("Timed out waiting for backend JSON")
 
 
+def stop_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def main() -> int:
     args = parse_args()
     print("network interfaces:")
@@ -186,18 +197,14 @@ def main() -> int:
         return 0
     except Exception as exc:
         print(f"smoke test failed: {exc}", file=sys.stderr)
+        stop_process(proc)
         if proc.stderr is not None:
             err = proc.stderr.read().strip()
             if err:
                 print(err, file=sys.stderr)
         return 1
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        stop_process(proc)
 
 
 if __name__ == "__main__":

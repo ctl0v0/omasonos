@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -22,6 +23,27 @@ class FakeGroup:
         self.volume += delta
 
 
+class FakeAVTransport:
+    def __init__(self):
+        self.media_info = {"CurrentURI": "", "CurrentURIMetaData": ""}
+        self.error = None
+
+    def GetMediaInfo(self, args):
+        self.args = args
+        if self.error is not None:
+            raise self.error
+        return self.media_info
+
+    def SetAVTransportURI(self, args):
+        self.set_uri_args = args
+
+    def Seek(self, args):
+        self.seek_args = args
+
+    def Play(self, args):
+        self.play_args = args
+
+
 class FakeZone:
     def __init__(self, uid, name, ip, household="HH1"):
         self.uid = uid
@@ -37,6 +59,7 @@ class FakeZone:
         self.available_actions = ["Set", "Play", "Pause", "Next"]
         self.music_source = "SPOTIFY_CONNECT"
         self.music_library = FakeMusicLibrary()
+        self.avTransport = FakeAVTransport()
 
     @property
     def visible_zones(self):
@@ -80,6 +103,13 @@ class FakeZone:
     def play_uri(self, **kwargs):
         self.played_uri = kwargs
 
+    def add_to_queue(self, item):
+        self.queued_item = item
+        return 4
+
+    def play_from_queue(self, index):
+        self.played_queue_index = index
+
 
 
 class FakeSearchResult(list):
@@ -103,11 +133,19 @@ class FakeResource:
         self.uri = uri
 
 
+class FakeReference:
+    def __init__(self, item_id="", desc="", uri=""):
+        self.item_id = item_id
+        self.desc = desc
+        self.resources = [FakeResource(uri)] if uri else []
+
+
 class FakeFavorite:
-    def __init__(self, title, uri="", metadata="<DIDL-Lite />"):
+    def __init__(self, title, uri="", metadata="<DIDL-Lite />", reference=None):
         self.title = title
         self.resources = [FakeResource(uri)] if uri else []
         self.resource_meta_data = metadata
+        self.reference = reference
 
 
 def make_controller(tmp_path):
@@ -145,6 +183,99 @@ def test_refresh_builds_target_and_playback(tmp_path):
         for room in household["rooms"]
     }
     assert room_states == {"Kitchen": "PLAYING", "Living Room": "PLAYING"}
+
+
+def test_radio_uses_media_metadata_when_track_metadata_is_blank(tmp_path):
+    controller, living, _, _ = make_controller(tmp_path)
+    living._transport = "PLAYING"
+    living.music_source = "RADIO"
+    living.get_current_track_info = lambda: {
+        "title": "",
+        "artist": "",
+        "album": "",
+        "album_art": "",
+        "position": "00:02:10",
+        "duration": "00:00:00",
+    }
+    living.avTransport.media_info = {
+        "CurrentURI": "x-sonosapi-stream:station",
+        "CurrentURIMetaData": (
+            '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            "<item><dc:title>Connecticut Public Radio</dc:title>"
+            "<upnp:albumArtURI>https://example.test/station.png</upnp:albumArtURI>"
+            "</item></DIDL-Lite>"
+        ),
+    }
+
+    snapshot = controller.refresh()
+
+    assert snapshot["playback"]["state"] == "PLAYING"
+    assert snapshot["playback"]["title"] == "Connecticut Public Radio"
+    assert snapshot["playback"]["artworkUrl"] == "https://example.test/station.png"
+    assert snapshot["playback"]["metadataState"] == "fresh"
+
+
+def test_complete_media_title_replaces_truncated_track_title(tmp_path):
+    controller, living, _, _ = make_controller(tmp_path)
+    living._transport = "PLAYING"
+    living.get_current_track_info = lambda: {
+        "title": "Luigi Mangione’s High-Risk L",
+        "artist": "The New York Times",
+        "album": "The Daily",
+        "album_art": "",
+        "position": "00:08:42",
+        "duration": "00:26:39",
+    }
+    living.avTransport.media_info = {
+        "CurrentURI": "https://example.test/daily.mp3",
+        "CurrentURIMetaData": (
+            '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/">'
+            "<item><dc:title>Luigi Mangione’s High-Risk Legal Strategy</dc:title>"
+            "</item></DIDL-Lite>"
+        ),
+    }
+
+    snapshot = controller.refresh()
+
+    assert snapshot["playback"]["title"] == (
+        "Luigi Mangione’s High-Risk Legal Strategy"
+    )
+
+
+def test_transient_metadata_failure_keeps_last_confirmed_track(tmp_path):
+    controller, living, _, _ = make_controller(tmp_path)
+    living._transport = "PLAYING"
+    first = controller.refresh()
+    assert first["playback"]["title"] == "Track"
+
+    def fail_track_info():
+        raise OSError("speaker busy")
+
+    living.get_current_track_info = fail_track_info
+    living.avTransport.error = OSError("media query timed out")
+    recovered = controller.refresh(rediscover=False)
+
+    assert recovered["playback"]["state"] == "PLAYING"
+    assert recovered["playback"]["title"] == "Track"
+    assert recovered["playback"]["artworkUrl"].endswith("/getaa?s=1&u=x")
+    assert recovered["playback"]["metadataState"] == "cached"
+    assert recovered["playback"]["stale"] is True
+    assert recovered["status"]["playbackDegraded"] is True
+
+
+def test_confirmed_stop_clears_previous_playback_metadata(tmp_path):
+    controller, living, _, _ = make_controller(tmp_path)
+    living._transport = "PLAYING"
+    controller.refresh()
+
+    living._transport = "STOPPED"
+    stopped = controller.refresh(rediscover=False)
+
+    assert stopped["playback"]["state"] == "STOPPED"
+    assert stopped["playback"]["title"] == ""
+    assert stopped["playback"]["artworkUrl"] == ""
+    assert stopped["playback"]["metadataState"] == "empty"
 
 
 def test_no_speakers_is_an_expected_offline_state():
@@ -239,6 +370,104 @@ def test_play_favorite_uses_cached_uri_and_metadata(tmp_path):
         "meta": "<meta />",
         "start": True,
     }
+
+
+def test_queueable_container_favorite_is_added_and_played(tmp_path):
+    controller, living, _, _ = make_controller(tmp_path)
+    reference = FakeReference(uri="x-rincon-cpcontainer:album-1")
+    living.music_library = FakeMusicLibrary(
+        [
+            FakeFavorite(
+                "Saved album",
+                "x-rincon-cpcontainer:album-1",
+                reference=reference,
+            )
+        ]
+    )
+    snapshot = controller.refresh()
+    favorite_id = snapshot["favorites"]["items"][0]["id"]
+
+    controller.play_favorite(favorite_id)
+
+    assert living.queued_item is reference
+    assert living.played_queue_index == 3
+
+
+def test_tunein_podcast_favorite_plays_latest_episode_without_developer_account(
+    tmp_path,
+):
+    controller, living, _, _ = make_controller(tmp_path)
+    reference = FakeReference(
+        item_id=(
+            "100b2064p295446%3Atopic--"
+            "2e8792e144a1455a82a2c35380306c07"
+        ),
+        desc="SA_RINCON85255_X_#Svc85255-0-Token",
+    )
+    living.music_library = FakeMusicLibrary(
+        [FakeFavorite("Stuff You Should Know", reference=reference)]
+    )
+    episode = type(
+        "FakeEpisode",
+        (),
+        {
+            "id": "episode-1",
+            "title": "The Manhattan Grid",
+            "desc": "SA_RINCON65031_",
+            "metadata": {
+                "track_metadata": type(
+                    "FakeTrackMetadata",
+                    (),
+                    {
+                        "metadata": {
+                            "podcast": "Stuff You Should Know",
+                            "host": "Josh and Chuck",
+                            "duration": 2852,
+                            "album_art_uri": (
+                                "https://cdn.example.test/sysk.png?version=1"
+                            ),
+                        }
+                    },
+                )()
+            },
+        },
+    )()
+
+    class FakeTuneIn:
+        def get_metadata(self, item_id, count):
+            self.request = (item_id, count)
+            return [episode]
+
+    tunein = FakeTuneIn()
+    controller._tunein_service = lambda coordinator: tunein
+    controller._tunein_media_url = lambda service, item: (
+        "https://podcast.example.test/episode.mp3"
+    )
+    snapshot = controller.refresh()
+    favorite = snapshot["favorites"]["items"][0]
+
+    controller.play_favorite(favorite["id"])
+
+    assert favorite["kind"] == "podcast"
+    assert tunein.request == (
+        "p295446:topic--2e8792e144a1455a82a2c35380306c07",
+        1,
+    )
+    assert living.played_uri["uri"] == "https://podcast.example.test/episode.mp3"
+    assert living.played_uri["start"] is True
+    metadata = ET.fromstring(living.played_uri["meta"])
+    assert metadata.findtext(".//{http://purl.org/dc/elements/1.1/}title") == (
+        "The Manhattan Grid"
+    )
+    assert metadata.findtext(
+        ".//{urn:schemas-upnp-org:metadata-1-0/upnp/}albumArtURI"
+    ) == "https://cdn.example.test/sysk.png?version=1"
+    assert metadata.findtext(
+        ".//{urn:schemas-upnp-org:metadata-1-0/upnp/}album"
+    ) == "Stuff You Should Know"
+    assert metadata.findtext(".//{http://purl.org/dc/elements/1.1/}creator") == (
+        "Josh and Chuck"
+    )
 
 
 def test_unknown_favorite_id_is_rejected(tmp_path):
@@ -471,6 +700,184 @@ def test_move_to_standalone_room_waits_for_topology_then_plays_destination(
     ]
     assert state.selected_room_uid == "R2"
     assert cache_clears == ["R1", "R2"] * 4
+
+
+def test_direct_stream_handoff_avoids_grouping_and_preserves_position():
+    kitchen = FakeZone("R1", "Kitchen", "10.0.0.2")
+    office = FakeZone("R2", "Office", "10.0.0.3")
+    kitchen.avTransport.media_info = {
+        "CurrentURI": "https://podcast.example.test/daily.mp3",
+        "CurrentURIMetaData": "<DIDL-Lite />",
+    }
+    state = PersistentState(selected_room_uid="R1", cached_hosts=[])
+    state.save = lambda path=None: None  # type: ignore[method-assign]
+    controller = SonosController(
+        discover_fn=lambda **kwargs: {kitchen, office},
+        soco_factory=lambda host: kitchen,
+        network_scan_fn=lambda **kwargs: set(),
+        persistent_state=state,
+    )
+    controller._zones = {"R1": kitchen, "R2": office}
+    snapshot = {
+        "target": {
+            "householdId": "HH1",
+            "coordinatorUid": "R1",
+            "memberUids": ["R1"],
+        },
+        "playback": {
+            "state": "PLAYING",
+            "positionSec": 522,
+            "availableActions": ["Play", "Pause", "SeekTime"],
+        },
+        "households": [
+            {
+                "id": "HH1",
+                "rooms": [{"uid": "R1"}, {"uid": "R2"}],
+                "groups": [
+                    {"coordinatorUid": "R1", "memberUids": ["R1"]},
+                    {"coordinatorUid": "R2", "memberUids": ["R2"]},
+                ],
+            }
+        ],
+    }
+    controller.refresh = lambda **kwargs: snapshot  # type: ignore[method-assign]
+
+    controller.move_playback_to_room("R2")
+
+    assert kitchen._transport == "PAUSED_PLAYBACK"
+    assert office._transport == "PLAYING"
+    assert office.avTransport.set_uri_args == [
+        ("InstanceID", 0),
+        ("CurrentURI", "https://podcast.example.test/daily.mp3"),
+        ("CurrentURIMetaData", "<DIDL-Lite />"),
+    ]
+    assert office.avTransport.seek_args == [
+        ("InstanceID", 0),
+        ("Unit", "REL_TIME"),
+        ("Target", "00:08:42"),
+    ]
+    assert state.selected_room_uid == "R2"
+
+
+def test_authoritative_topology_refresh_bypasses_subscription_cache():
+    living = FakeZone("R1", "Living Room", "10.0.0.2")
+    processed = []
+
+    class FakeTopologyService:
+        def GetZoneGroupState(self, **kwargs):
+            assert kwargs == {"timeout": 2.0}
+            return {"ZoneGroupState": "<ZoneGroups />"}
+
+    class FakeTopologyState:
+        has_subscriptions = True
+
+        def process_payload(self, **kwargs):
+            processed.append(kwargs)
+
+    living.zoneGroupTopology = FakeTopologyService()
+    living.zone_group_state = FakeTopologyState()
+    controller = SonosController(
+        discover_fn=lambda **kwargs: set(),
+        soco_factory=lambda host: living,
+        network_scan_fn=lambda **kwargs: set(),
+        persistent_state=PersistentState(),
+    )
+    controller._zones = {"R1": living}
+
+    assert controller._refresh_topology_authoritatively() is True
+    assert processed == [
+        {
+            "payload": "<ZoneGroups />",
+            "source": "omasonos-authoritative-poll",
+            "source_ip": "10.0.0.2",
+        }
+    ]
+
+
+def test_authoritative_topology_refresh_targets_requested_household():
+    first = FakeZone("R1", "Living Room", "10.0.0.2", household="HH1")
+    second = FakeZone("R2", "Office", "10.0.1.2", household="HH2")
+    called = []
+
+    class FakeTopologyService:
+        def __init__(self, household):
+            self.household = household
+
+        def GetZoneGroupState(self, **kwargs):
+            called.append(self.household)
+            return {"ZoneGroupState": "<ZoneGroups />"}
+
+    class FakeTopologyState:
+        def process_payload(self, **kwargs):
+            pass
+
+    for zone in (first, second):
+        zone.zoneGroupTopology = FakeTopologyService(zone.household_id)
+        zone.zone_group_state = FakeTopologyState()
+    controller = SonosController(
+        discover_fn=lambda **kwargs: set(),
+        soco_factory=lambda host: first,
+        network_scan_fn=lambda **kwargs: set(),
+        persistent_state=PersistentState(),
+    )
+    controller._zones = {"R1": first, "R2": second}
+
+    controller.refresh_event_topologies({"HH2"})
+
+    assert called == ["HH2"]
+
+
+def test_failed_handoff_verification_restores_original_playback(monkeypatch):
+    kitchen = FakeZone("R1", "Kitchen", "10.0.0.2")
+    office = FakeZone("R2", "Office", "10.0.0.3")
+    events = []
+    kitchen.pause = lambda: events.append(("pause", "R1"))
+    kitchen.play = lambda: events.append(("play", "R1"))
+    office.join = lambda coordinator: events.append(("join", "R2", coordinator.uid))
+    office.unjoin = lambda: events.append(("unjoin", "R2"))
+    state = PersistentState(selected_room_uid="R1", cached_hosts=[])
+    state.save = lambda path=None: None  # type: ignore[method-assign]
+    controller = SonosController(
+        discover_fn=lambda **kwargs: {kitchen, office},
+        soco_factory=lambda host: kitchen,
+        network_scan_fn=lambda **kwargs: set(),
+        persistent_state=state,
+    )
+    controller._zones = {"R1": kitchen, "R2": office}
+
+    standalone = {
+        "target": {
+            "householdId": "HH1",
+            "coordinatorUid": "R1",
+            "memberUids": ["R1"],
+        },
+        "playback": {"state": "PLAYING"},
+        "households": [
+            {
+                "id": "HH1",
+                "rooms": [{"uid": "R1"}, {"uid": "R2"}],
+                "groups": [
+                    {"coordinatorUid": "R1", "memberUids": ["R1"]},
+                    {"coordinatorUid": "R2", "memberUids": ["R2"]},
+                ],
+            }
+        ],
+    }
+    snapshots = iter([standalone, standalone, standalone, standalone])
+    controller.refresh = lambda **kwargs: next(snapshots)  # type: ignore[method-assign]
+    monkeypatch.setattr("omasonos_backend.controller.TOPOLOGY_SETTLE_ATTEMPTS", 2)
+    monkeypatch.setattr("omasonos_backend.controller.TOPOLOGY_SETTLE_INTERVAL_SEC", 0)
+
+    with pytest.raises(ControllerError, match="did not prepare"):
+        controller.move_playback_to_room("R2")
+
+    assert events == [
+        ("pause", "R1"),
+        ("join", "R2", "R1"),
+        ("unjoin", "R2"),
+        ("play", "R1"),
+    ]
+    assert state.selected_room_uid == "R1"
 
 
 def test_apply_members_joins_destination_then_detaches_and_stops_old_coordinator():

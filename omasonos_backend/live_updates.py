@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import threading
 from typing import Any
 
 LOG = logging.getLogger(__name__)
@@ -25,23 +26,40 @@ class WakeQueue(queue.Queue[Any]):
         except (BlockingIOError, OSError):
             pass
 
-    def drain(self) -> int:
-        count = 0
+    def drain_items(self) -> list[Any]:
         while True:
             try:
                 os.read(self.read_fd, 4096)
             except BlockingIOError:
                 break
+        items: list[Any] = []
         while True:
             try:
-                self.get_nowait()
-                count += 1
+                items.append(self.get_nowait())
             except queue.Empty:
-                return count
+                return items
+
+    def drain(self) -> int:
+        return len(self.drain_items())
 
     def close(self) -> None:
         os.close(self.read_fd)
         os.close(self.write_fd)
+
+
+class TaggedEventQueue:
+    """Attach the subscription identity without touching SoCo callback threads."""
+
+    def __init__(self, target: WakeQueue, subscription_key: str) -> None:
+        self.target = target
+        self.subscription_key = subscription_key
+
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+        self.target.put(
+            {"subscriptionKey": self.subscription_key, "event": item},
+            block=block,
+            timeout=timeout,
+        )
 
 
 class EventSubscriptionManager:
@@ -50,30 +68,42 @@ class EventSubscriptionManager:
         self.subscriptions: dict[str, Any] = {}
         self.errors: list[str] = []
         self.complete = False
+        self._invalid: set[str] = set()
+        self._lock = threading.RLock()
 
     def reconcile(self, services: dict[str, Any]) -> dict[str, Any]:
-        desired = set(services)
-        for key in list(self.subscriptions):
-            if key not in desired:
-                self._unsubscribe(key)
+        with self._lock:
+            desired = set(services)
+            for key, subscription in list(self.subscriptions.items()):
+                healthy = bool(getattr(subscription, "is_subscribed", True))
+                time_left = getattr(subscription, "time_left", None)
+                if time_left is not None and time_left <= 0:
+                    healthy = False
+                if key not in desired or key in self._invalid or not healthy:
+                    self._unsubscribe(key)
+            self._invalid.clear()
 
-        self.errors = []
-        for key, service in services.items():
-            if key in self.subscriptions:
-                continue
-            try:
-                subscription = service.subscribe(
-                    requested_timeout=SUBSCRIPTION_LEASE_SEC,
-                    auto_renew=True,
-                    event_queue=self.event_queue,
-                    strict=True,
-                )
-                subscription.auto_renew_fail = self._auto_renew_failed
-                self.subscriptions[key] = subscription
-            except Exception as exc:  # noqa: BLE001 - network fallback is intentional
-                message = f"{key}: {type(exc).__name__}: {exc}"
-                self.errors.append(message)
-                LOG.warning("Sonos event subscription failed: %s", message)
+            self.errors = []
+            for key, service in services.items():
+                if key in self.subscriptions:
+                    continue
+                try:
+                    subscription = service.subscribe(
+                        requested_timeout=SUBSCRIPTION_LEASE_SEC,
+                        auto_renew=True,
+                        event_queue=TaggedEventQueue(self.event_queue, key),
+                        strict=True,
+                    )
+                    subscription.auto_renew_fail = (
+                        lambda exc, subscription_key=key: self._auto_renew_failed(
+                            subscription_key, exc
+                        )
+                    )
+                    self.subscriptions[key] = subscription
+                except Exception as exc:  # noqa: BLE001 - network fallback is intentional
+                    message = f"{key}: {type(exc).__name__}: {exc}"
+                    self.errors.append(message)
+                    LOG.warning("Sonos event subscription failed: %s", message)
 
         listener = ""
         try:
@@ -85,23 +115,35 @@ class EventSubscriptionManager:
         except Exception as exc:  # noqa: BLE001
             self.errors.append(f"listener: {type(exc).__name__}: {exc}")
 
-        self.complete = bool(services) and len(self.subscriptions) == len(services)
+        with self._lock:
+            self.complete = (
+                bool(services)
+                and not self._invalid
+                and len(self.subscriptions) == len(services)
+            )
+            subscribed = len(self.subscriptions)
         return {
             "mode": "events" if self.complete else "polling",
             "listener": listener,
-            "subscribed": len(self.subscriptions),
+            "subscribed": subscribed,
             "requested": len(services),
             "errors": list(self.errors),
         }
 
-    def _auto_renew_failed(self, exc: Exception) -> None:
-        message = f"auto-renew: {type(exc).__name__}: {exc}"
-        self.errors.append(message)
-        self.complete = False
+    def _auto_renew_failed(self, key: str, exc: Exception) -> None:
+        message = f"{key} auto-renew: {type(exc).__name__}: {exc}"
+        with self._lock:
+            self.errors.append(message)
+            self._invalid.add(key)
+            self.complete = False
         LOG.warning("Sonos event subscription renewal failed: %s", message)
+        # Wake the protocol loop immediately so reconcile can replace the dead
+        # subscription instead of waiting for the next background poll.
+        self.event_queue.put({"type": "subscription-renewal-failed", "key": key})
 
     def _unsubscribe(self, key: str) -> None:
-        subscription = self.subscriptions.pop(key, None)
+        with self._lock:
+            subscription = self.subscriptions.pop(key, None)
         if subscription is None:
             return
         try:
@@ -117,7 +159,8 @@ class EventSubscriptionManager:
             LOG.debug("Could not unsubscribe %s: %s", key, exc)
 
     def close(self) -> None:
-        for key in list(self.subscriptions):
-            self._unsubscribe(key)
+        with self._lock:
+            for key in list(self.subscriptions):
+                self._unsubscribe(key)
         self.event_queue.close()
         self.complete = False

@@ -42,8 +42,19 @@ BarWidget {
     ? String(sonos.favoriteStartingTitle || "") : ""
   readonly property string playbackState: String(playback.state || "").toUpperCase()
   readonly property bool playing: playbackState === "PLAYING"
+    || playbackState === "TRANSITIONING"
   readonly property string title: String(playback.title || "")
   readonly property string artist: String(playback.artist || "")
+  readonly property string displayTitle: {
+    if (title !== "") return title
+    if (playing) {
+      return String(playback.source || "").toUpperCase() === "RADIO"
+        ? "Radio playing"
+        : "Audio playing"
+    }
+    if (playbackState === "PAUSED_PLAYBACK") return "Audio paused"
+    return "Nothing playing"
+  }
   readonly property string roomLabel: target ? String(target.roomLabel || "Sonos") : "Sonos"
   readonly property string barLabel: {
     if (!online) return disconnectedTitle
@@ -309,7 +320,7 @@ BarWidget {
 
           Text {
             width: parent.width
-            text: root.online ? (root.title || "Nothing playing") : root.disconnectedTitle
+            text: root.online ? root.displayTitle : root.disconnectedTitle
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.subtitle
@@ -686,7 +697,7 @@ BarWidget {
             text: root.favorites.state === "error"
               ? "Favorites unavailable: " + root.favorites.error
               : root.favorites.items.length === 0
-                ? "No directly playable Favorites found."
+                ? "No playable Favorites found."
                 : root.favorites.unsupported + " saved item"
                   + (root.favorites.unsupported === 1 ? "" : "s")
                   + " omitted because Sonos did not provide a playable source."
@@ -702,7 +713,8 @@ BarWidget {
               required property var modelData
               width: parent.width
               text: modelData.title
-              iconText: modelData.kind === "radio" ? "󰎆" : "󰝚"
+              iconText: modelData.kind === "radio" ? "󰎆"
+                : modelData.kind === "podcast" ? "󰦔" : "󰝚"
               foreground: root.bar.foreground
               bordered: true
               leftAlign: true
@@ -751,11 +763,9 @@ BarWidget {
               id: roomIdentity
               width: Style.space(116)
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(4)
 
               Text {
-                width: Math.min(implicitWidth,
-                  roomIdentity.width - playingBadge.width - roomIdentity.spacing)
+                width: roomIdentity.width
                 anchors.verticalCenter: parent.verticalCenter
                 text: roomRow.modelData.name
                 color: roomRow.audioPlaying ? Color.accent : root.bar.foreground
@@ -763,41 +773,6 @@ BarWidget {
                 font.pixelSize: Style.font.body
                 font.bold: roomRow.audioPlaying
                 elide: Text.ElideRight
-              }
-
-              Item {
-                id: playingBadge
-                width: Style.space(20)
-                height: Style.space(20)
-                anchors.verticalCenter: parent.verticalCenter
-
-                Text {
-                  anchors.centerIn: parent
-                  visible: roomRow.audioPlaying
-                  text: "♪"
-                  color: Color.accent
-                  font.family: root.bar.fontFamily
-                  font.pixelSize: Style.font.iconLarge
-                  font.bold: true
-                }
-
-                SequentialAnimation on opacity {
-                  running: roomRow.audioPlaying
-                  loops: Animation.Infinite
-                  NumberAnimation {
-                    from: 1.0
-                    to: 0.52
-                    duration: 720
-                    easing.type: Easing.InOutSine
-                  }
-                  NumberAnimation {
-                    from: 0.52
-                    to: 1.0
-                    duration: 720
-                    easing.type: Easing.InOutSine
-                  }
-                  onRunningChanged: if (!running) playingBadge.opacity = 1.0
-                }
               }
             }
 

@@ -1,5 +1,8 @@
 # OmasOnOS Build Plan
 
+> Historical planning document. The README, manifest, and current source are
+> authoritative for the implemented plugin.
+
 ## Recommendation
 
 Build a local-first Omarchy plugin, working name `omasonos`, using SoCo rather than the Sonos cloud API.

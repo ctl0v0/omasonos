@@ -19,6 +19,7 @@ Top-level keys:
 - `households[]`: logical rooms and groups, isolated by Sonos household ID.
 - `selectedAnchorRoomUid`: persisted stable room identity.
 - `target`: the currently controlled group.
+- `favorites`: compatible Sonos Favorites and loading diagnostics.
 - `playback`: target-coordinator transport metadata and capabilities.
 
 The frontend must treat the snapshot as authoritative after mutations.
@@ -27,9 +28,10 @@ The frontend must treat the snapshot as authoritative after mutations.
 
 - Topology, transport, group-volume, and room-rendering event subscriptions are
   implemented with a 75 ms event-burst window. Incomplete subscriptions fall
-  back to polling; healthy event mode retains slower 10/30-second safety polls.
+  back to 2/5-second polling; healthy event mode retains 5/15-second safety
+  polls for an open/closed panel.
 - The QML group picker, room mixer, staged grouping view, and seek UI are in
   place, but the full keyboard model and large-household layout still need work.
-- `requirements.lock` is exact-pinned but not yet transitive/hash-locked.
+- `requirements.lock` is fully transitive and hash-locked for Python 3.14.
 - Discovery, callback reachability, and basic controller operations work on the
   six-room Sonos S2 household; the full hardware scenario matrix remains.

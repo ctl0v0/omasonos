@@ -464,16 +464,22 @@ BarWidget {
           onMoved: function(v) { root.sonos.seek(v) }
         }
 
-        Row {
+        Item {
           width: parent.width
+          implicitHeight: Math.max(elapsedTime.implicitHeight, durationTime.implicitHeight)
+
           Text {
+            id: elapsedTime
+            anchors.left: parent.left
             text: root.formatTime(root.playback.positionSec)
             color: Qt.darker(root.bar.foreground, 1.45)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
           }
-          Item { width: parent.width - parent.children[0].width - parent.children[2].width }
+
           Text {
+            id: durationTime
+            anchors.right: parent.right
             text: root.formatTime(root.playback.durationSec)
             color: Qt.darker(root.bar.foreground, 1.45)
             font.family: root.bar.fontFamily
